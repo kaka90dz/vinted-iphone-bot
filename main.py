@@ -1,4 +1,5 @@
 import sys
+import io
 import logging
 import os
 import asyncio
@@ -6,6 +7,8 @@ from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
 from typing import Final
 from datetime import datetime, timezone
 
+# Corrige l'encodage corrompu observé dans les logs ("modÃ¨le", "Ã©tat") :
+# force stdout/stderr en UTF-8 explicite, avant toute autre initialisation.
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 if hasattr(sys.stderr, "reconfigure"):
@@ -21,7 +24,19 @@ from telegram.ext import (
     PicklePersistence,
 )
 
-from sources.vinted import fetch as fetch_vinted, get_last_stats as get_vinted_stats
+from sources.facebook_marketplace import (
+    fetch as fetch_facebook,
+    get_last_stats as get_facebook_stats,
+    MAX_DISTANCE_KM,
+    FACEBOOK_MARKETPLACE_CITY,
+    ACCEPT_UNKNOWN_LOCATION,
+    MAX_LISTING_AGE_HOURS,
+    ACCEPT_UNKNOWN_DATE,
+)
+from sources.vinted import (
+    fetch as fetch_vinted,
+    get_last_stats as get_vinted_stats,
+)
 from pipeline.normalize import normalize_listing, USE_ANTHROPIC_NORMALIZER
 import pipeline.normalize as normalize_module
 from pipeline.estimate import estimate_listing
@@ -38,22 +53,21 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
     stream=sys.stdout,
 )
+
 LOGGER = logging.getLogger(__name__)
 
 TOKEN: Final[str | None] = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_CHAT_ID: Final[str | None] = os.getenv("TELEGRAM_CHAT_ID")
-PERSISTENCE_FILE: Final[str] = os.getenv("PERSISTENCE_FILE", "/tmp/vinted_bot_data.pickle")
 
-# Bot mono-devise (Vinted France = EUR uniquement) — contrairement à
-# iphone-deals-bot qui gère EUR + CAD, ça simplifie toutes les commandes
-# calculateur : plus besoin de préciser la devise à chaque fois.
+PERSISTENCE_FILE: Final[str] = os.getenv("PERSISTENCE_FILE", "/tmp/iphone_bot_data.pickle")
+
+SUPPORTED_CURRENCIES: Final[set[str]] = {"EUR", "CAD"}
+
 DEFAULT_SETTINGS: Final[dict[str, Decimal]] = {
-    "min_profit_eur": Decimal("30"),
-    "min_roi": Decimal("25"),
-    # Vinted ne facture AUCUN frais de vente au vendeur (les frais de
-    # protection acheteur sont payés par l'acheteur, en plus du prix
-    # affiché) — défaut à 0%, contrairement à un marketplace classique.
-    "default_fee_percent": Decimal("0"),
+    "min_profit_eur": Decimal("40"),
+    "min_profit_cad": Decimal("60"),
+    "min_roi": Decimal("20"),
+    "default_fee_percent": Decimal("13"),
     "default_risk_percent": Decimal("5"),
     "safety_resale_percent": Decimal("90"),
 }
@@ -63,11 +77,22 @@ PERCENT_STEP: Final[Decimal] = Decimal("0.1")
 
 CYCLE_SECONDS: Final[int] = int(os.getenv("CYCLE_SECONDS", "900"))
 DEFAULT_SCORE_THRESHOLD: Final[int] = int(os.getenv("SCORE_THRESHOLD", "55"))
-SOURCES = [fetch_vinted]
-SOURCE_STATS_GETTERS = {fetch_vinted: get_vinted_stats}
+SOURCES = [fetch_facebook, fetch_vinted]
 
+# Chaque source expose ses propres stats (found_raw, accepted_source, etc.)
+# via sa fonction get_last_stats() ; cette table permet à run_scan_cycle
+# d'appeler la bonne selon la source en cours, plutôt que de supposer
+# Facebook Marketplace comme seule source possible.
+SOURCE_STATS_GETTERS = {
+    fetch_facebook: get_facebook_stats,
+    fetch_vinted: get_vinted_stats,
+}
+
+# Empêche un scan manuel ("Scanner maintenant") et le scan automatique
+# planifié de se chevaucher.
 SCAN_LOCK = asyncio.Lock()
 
+# État du bot exposé par le bouton "État du bot".
 BOT_STATE = {
     "last_found": 0,
     "last_sent": 0,
@@ -77,12 +102,12 @@ BOT_STATE = {
 
 
 # ---------------------------------------------------------
-# OUTILS CALCULATEUR
+# OUTILS CALCULATEUR (inchangés)
 # ---------------------------------------------------------
 
 def parse_decimal(value: str) -> Decimal:
     cleaned = (
-        value.strip().replace("€", "").replace("%", "")
+        value.strip().replace("€", "").replace("$", "").replace("%", "")
         .replace(" ", "").replace(",", ".")
     )
     try:
@@ -96,9 +121,9 @@ def parse_decimal(value: str) -> Decimal:
     return number
 
 
-def money(value: Decimal) -> str:
+def money(value: Decimal, currency: str) -> str:
     rounded = value.quantize(MONEY_STEP, rounding=ROUND_HALF_UP)
-    return f"{rounded} €"
+    return f"{rounded} $ CA" if currency == "CAD" else f"{rounded} €"
 
 
 def percent(value: Decimal) -> str:
@@ -110,6 +135,10 @@ def get_settings(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Decimal]:
     for key, value in DEFAULT_SETTINGS.items():
         settings.setdefault(key, value)
     return settings
+
+
+def target_profit(currency: str, settings: dict[str, Decimal]) -> Decimal:
+    return settings["min_profit_cad"] if currency == "CAD" else settings["min_profit_eur"]
 
 
 async def check_access(update: Update) -> bool:
@@ -163,12 +192,13 @@ def analysis_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("📘 Aide", callback_data="help"),
          InlineKeyboardButton("⚙️ Réglages", callback_data="settings")],
-        [InlineKeyboardButton("🧮 Exemple", callback_data="example")],
+        [InlineKeyboardButton("🧮 Exemple France", callback_data="example_eur"),
+         InlineKeyboardButton("🇨🇦 Exemple Canada", callback_data="example_cad")],
     ])
 
 
 def build_analysis(*, purchase_price, resale_price, repair_cost, shipping_in, other_costs,
-                    selling_fee_percent, risk_percent, settings) -> dict:
+                    selling_fee_percent, risk_percent, currency, settings) -> dict:
     selling_fees = resale_price * selling_fee_percent / Decimal("100")
     base_before_risk = purchase_price + repair_cost + shipping_in + other_costs + selling_fees
     risk_cost = base_before_risk * risk_percent / Decimal("100")
@@ -179,7 +209,7 @@ def build_analysis(*, purchase_price, resale_price, repair_cost, shipping_in, ot
     purchase_roi = profit / purchase_price * Decimal("100") if purchase_price > 0 else Decimal("0")
     break_even_resale = total_cost
 
-    target = settings["min_profit_eur"]
+    target = target_profit(currency, settings)
     min_roi = settings["min_roi"]
 
     fixed_costs = repair_cost + shipping_in + other_costs + selling_fees
@@ -210,19 +240,19 @@ def build_analysis(*, purchase_price, resale_price, repair_cost, shipping_in, ot
 
 
 # ---------------------------------------------------------
-# COMMANDES CALCULATEUR (mono-devise EUR — pas de paramètre devise)
+# COMMANDES CALCULATEUR (inchangées, condensées)
 # ---------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
     text = (
-        "🤖 <b>Bot Vinted iPhone</b>\n\n"
+        "🤖 <b>Bot iPhone Marketplace</b>\n\n"
         "<b>Calculateur :</b> /analyse, /simple, /enchere, /compare, /reglages\n"
         "<b>Menu complet :</b> /menu\n\n"
-        "🔎 Le scan automatique Vinted tourne en tâche de fond et n'envoie "
-        "que des annonces de téléphones complets — jamais d'étuis, pièces, "
-        "kits ou services."
+        "🔎 Le scan automatique tourne en tâche de fond "
+        "et n'envoie que des annonces de téléphones complets — jamais "
+        "d'étuis, pièces, kits ou services."
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=analysis_keyboard())
 
@@ -230,11 +260,11 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    if len(context.args) != 7:
+    if len(context.args) != 8:
         await update.effective_message.reply_text(
-            "❌ <b>Il faut 7 valeurs.</b>\n\n"
-            "<code>/analyse achat revente réparation livraison autres frais% risque%</code>\n\n"
-            "Exemple :\n<code>/analyse 25 90 0 3.5 2 0 5</code>",
+            "❌ <b>Il faut 8 valeurs.</b>\n\n"
+            "<code>/analyse achat revente réparation livraison autres frais% risque% devise</code>\n\n"
+            "Exemple :\n<code>/analyse 38 120 0 4.15 3 13 5 EUR</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -246,13 +276,16 @@ async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         other = parse_decimal(context.args[4])
         fee_percent = parse_decimal(context.args[5])
         risk_percent = parse_decimal(context.args[6])
+        currency = context.args[7].upper()
+        if currency not in SUPPORTED_CURRENCIES:
+            raise ValueError("Devise invalide.")
         if fee_percent > 100 or risk_percent > 100:
             raise ValueError("Pourcentage invalide.")
         if resale <= 0:
             raise ValueError("La revente doit être supérieure à zéro.")
     except ValueError:
         await update.effective_message.reply_text(
-            "❌ Valeurs incorrectes.\n\nExemple :\n<code>/analyse 25 90 0 3.5 2 0 5</code>",
+            "❌ Valeurs incorrectes.\n\nExemple :\n<code>/analyse 38 120 0 4.15 3 13 5 EUR</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -261,7 +294,7 @@ async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     result = build_analysis(
         purchase_price=purchase, resale_price=resale, repair_cost=repair,
         shipping_in=shipping, other_costs=other, selling_fee_percent=fee_percent,
-        risk_percent=risk_percent, settings=settings,
+        risk_percent=risk_percent, currency=currency, settings=settings,
     )
     score = result["score"]
     score_icon = "🟢" if score >= 80 else "🟡" if score >= 60 else "🟠" if score >= 40 else "🔴"
@@ -270,26 +303,26 @@ async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         f"<b>{result['verdict']}</b>\n\n"
         f"{score_icon} <b>Score : {score}/100</b>\n\n"
         "<b>📥 Achat et préparation</b>\n"
-        f"Prix d'achat : {money(purchase)}\n"
-        f"Réparation : {money(repair)}\n"
-        f"Livraison reçue : {money(shipping)}\n"
-        f"Autres coûts : {money(other)}\n"
-        f"Risque prévu : {money(result['risk_cost'])}\n\n"
+        f"Prix d'achat : {money(purchase, currency)}\n"
+        f"Réparation : {money(repair, currency)}\n"
+        f"Livraison reçue : {money(shipping, currency)}\n"
+        f"Autres coûts : {money(other, currency)}\n"
+        f"Risque prévu : {money(result['risk_cost'], currency)}\n\n"
         "<b>📤 Revente</b>\n"
-        f"Prix estimé : {money(resale)}\n"
-        f"Frais de vente : {money(result['selling_fees'])} ({percent(fee_percent)})\n\n"
+        f"Prix estimé : {money(resale, currency)}\n"
+        f"Frais de vente : {money(result['selling_fees'], currency)} ({percent(fee_percent)})\n\n"
         "<b>📊 Résultats</b>\n"
-        f"Coût total : {money(result['total_cost'])}\n"
-        f"Marge nette : <b>{money(result['profit'])}</b>\n"
+        f"Coût total : {money(result['total_cost'], currency)}\n"
+        f"Marge nette : <b>{money(result['profit'], currency)}</b>\n"
         f"ROI global : <b>{percent(result['roi'])}</b>\n"
         f"Profit / achat : {percent(result['purchase_roi'])}\n"
-        f"Seuil de rentabilité : {money(result['break_even_resale'])}\n\n"
+        f"Seuil de rentabilité : {money(result['break_even_resale'], currency)}\n\n"
         "<b>🛡 Scénario prudent</b>\n"
-        f"Revente réduite à {percent(settings['safety_resale_percent'])} : {money(result['safe_resale'])}\n"
-        f"Marge prudente : <b>{money(result['safe_profit'])}</b>\n\n"
+        f"Revente réduite à {percent(settings['safety_resale_percent'])} : {money(result['safe_resale'], currency)}\n"
+        f"Marge prudente : <b>{money(result['safe_profit'], currency)}</b>\n\n"
         "<b>🎯 Décision</b>\n"
-        f"Marge minimale : {money(result['target_profit'])}\n"
-        f"Prix d'achat maximal conseillé : <b>{money(result['maximum_purchase'])}</b>"
+        f"Marge minimale : {money(result['target_profit'], currency)}\n"
+        f"Prix d'achat maximal conseillé : <b>{money(result['maximum_purchase'], currency)}</b>"
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=analysis_keyboard())
 
@@ -297,10 +330,10 @@ async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def simple(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    if len(context.args) != 4:
+    if len(context.args) != 5:
         await update.effective_message.reply_text(
-            "Utilisation :\n<code>/simple achat revente réparation livraison</code>\n\n"
-            "Exemple :\n<code>/simple 25 90 0 3.5</code>",
+            "Utilisation :\n<code>/simple achat revente réparation livraison devise</code>\n\n"
+            "Exemple :\n<code>/simple 38 120 0 4.15 EUR</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -309,13 +342,16 @@ async def simple(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         resale = parse_decimal(context.args[1])
         repair = parse_decimal(context.args[2])
         shipping = parse_decimal(context.args[3])
+        currency = context.args[4].upper()
+        if currency not in SUPPORTED_CURRENCIES:
+            raise ValueError
     except ValueError:
         await update.effective_message.reply_text("❌ Format incorrect.")
         return
     settings = get_settings(context)
     context.args = [
         str(purchase), str(resale), str(repair), str(shipping), "0",
-        str(settings["default_fee_percent"]), str(settings["default_risk_percent"]),
+        str(settings["default_fee_percent"]), str(settings["default_risk_percent"]), currency,
     ]
     await analyse(update, context)
 
@@ -323,10 +359,10 @@ async def simple(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def enchere(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    if len(context.args) != 6:
+    if len(context.args) != 7:
         await update.effective_message.reply_text(
-            "Utilisation :\n<code>/enchere revente réparation livraison autres frais% risque%</code>\n\n"
-            "Exemple :\n<code>/enchere 130 0 4.5 2 0 5</code>",
+            "Utilisation :\n<code>/enchere revente réparation livraison autres frais% risque% devise</code>\n\n"
+            "Exemple :\n<code>/enchere 260 0 5.99 3 13 5 EUR</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -337,11 +373,14 @@ async def enchere(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         other = parse_decimal(context.args[3])
         fee_percent = parse_decimal(context.args[4])
         risk_percent = parse_decimal(context.args[5])
+        currency = context.args[6].upper()
+        if currency not in SUPPORTED_CURRENCIES:
+            raise ValueError
     except ValueError:
         await update.effective_message.reply_text("❌ Format incorrect.")
         return
     settings = get_settings(context)
-    target = settings["min_profit_eur"]
+    target = target_profit(currency, settings)
     selling_fees = resale * fee_percent / Decimal("100")
     fixed_costs = repair + shipping + other + selling_fees
     preliminary_max = resale - fixed_costs - target
@@ -350,15 +389,15 @@ async def enchere(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     cautious_bid = max_bid * Decimal("0.95")
     await update.effective_message.reply_text(
         "🔨 <b>Calcul d'enchère maximale</b>\n\n"
-        f"Revente estimée : {money(resale)}\n"
-        f"Réparation : {money(repair)}\n"
-        f"Livraison : {money(shipping)}\n"
-        f"Autres coûts : {money(other)}\n"
-        f"Frais de vente estimés : {money(selling_fees)}\n"
-        f"Réserve de risque : {money(risk_reserve)}\n"
-        f"Marge visée : {money(target)}\n\n"
-        f"🛑 <b>Maximum absolu : {money(max_bid)}</b>\n"
-        f"✅ Enchère prudente conseillée : <b>{money(cautious_bid)}</b>",
+        f"Revente estimée : {money(resale, currency)}\n"
+        f"Réparation : {money(repair, currency)}\n"
+        f"Livraison : {money(shipping, currency)}\n"
+        f"Autres coûts : {money(other, currency)}\n"
+        f"Frais de vente estimés : {money(selling_fees, currency)}\n"
+        f"Réserve de risque : {money(risk_reserve, currency)}\n"
+        f"Marge visée : {money(target, currency)}\n\n"
+        f"🛑 <b>Maximum absolu : {money(max_bid, currency)}</b>\n"
+        f"✅ Enchère prudente conseillée : <b>{money(cautious_bid, currency)}</b>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -366,11 +405,11 @@ async def enchere(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    if len(context.args) != 6:
+    if len(context.args) != 7:
         await update.effective_message.reply_text(
             "Compare deux affaires simplifiées :\n\n"
-            "<code>/compare achat1 revente1 achat2 revente2 frais% risque%</code>\n\n"
-            "Exemple :\n<code>/compare 25 90 60 150 0 5</code>",
+            "<code>/compare achat1 revente1 achat2 revente2 frais% risque% devise</code>\n\n"
+            "Exemple :\n<code>/compare 38 120 110 240 13 5 EUR</code>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -381,6 +420,9 @@ async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         sell_2 = parse_decimal(context.args[3])
         fee_percent = parse_decimal(context.args[4])
         risk_percent = parse_decimal(context.args[5])
+        currency = context.args[6].upper()
+        if currency not in SUPPORTED_CURRENCIES:
+            raise ValueError
     except ValueError:
         await update.effective_message.reply_text("❌ Format incorrect.")
         return
@@ -388,16 +430,16 @@ async def compare(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     first = build_analysis(purchase_price=buy_1, resale_price=sell_1, repair_cost=Decimal("0"),
                             shipping_in=Decimal("0"), other_costs=Decimal("0"),
                             selling_fee_percent=fee_percent, risk_percent=risk_percent,
-                            settings=settings)
+                            currency=currency, settings=settings)
     second = build_analysis(purchase_price=buy_2, resale_price=sell_2, repair_cost=Decimal("0"),
                              shipping_in=Decimal("0"), other_costs=Decimal("0"),
                              selling_fee_percent=fee_percent, risk_percent=risk_percent,
-                             settings=settings)
+                             currency=currency, settings=settings)
     winner = "Affaire 1" if first["score"] >= second["score"] else "Affaire 2"
     await update.effective_message.reply_text(
         "⚖️ <b>Comparaison</b>\n\n"
-        f"<b>Affaire 1</b>\nMarge : {money(first['profit'])}\nROI : {percent(first['roi'])}\nScore : {first['score']}/100\n\n"
-        f"<b>Affaire 2</b>\nMarge : {money(second['profit'])}\nROI : {percent(second['roi'])}\nScore : {second['score']}/100\n\n"
+        f"<b>Affaire 1</b>\nMarge : {money(first['profit'], currency)}\nROI : {percent(first['roi'])}\nScore : {first['score']}/100\n\n"
+        f"<b>Affaire 2</b>\nMarge : {money(second['profit'], currency)}\nROI : {percent(second['roi'])}\nScore : {second['score']}/100\n\n"
         f"🏆 Meilleur choix : <b>{winner}</b>",
         parse_mode=ParseMode.HTML,
     )
@@ -410,16 +452,16 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     threshold = context.bot_data.get("score_threshold", DEFAULT_SCORE_THRESHOLD)
     await update.effective_message.reply_text(
         "⚙️ <b>Tes réglages</b>\n\n"
-        f"Marge minimale : {money(settings['min_profit_eur'])}\n"
+        f"Marge minimale EUR : {money(settings['min_profit_eur'], 'EUR')}\n"
+        f"Marge minimale CAD : {money(settings['min_profit_cad'], 'CAD')}\n"
         f"ROI minimum : {percent(settings['min_roi'])}\n"
-        f"Frais de vente par défaut : {percent(settings['default_fee_percent'])} "
-        "(0% par défaut — Vinted ne facture rien au vendeur)\n"
+        f"Frais de vente par défaut : {percent(settings['default_fee_percent'])}\n"
         f"Réserve de risque par défaut : {percent(settings['default_risk_percent'])}\n"
         f"Scénario prudent : {percent(settings['safety_resale_percent'])} du prix de revente\n\n"
         f"Seuil de score scan auto : {threshold}/100\n"
         f"Fréquence de scan : toutes les {CYCLE_SECONDS // 60} min\n\n"
-        "<b>Modifier :</b>\n<code>/setmarge 40</code>\n<code>/setroi 25</code>\n"
-        "<code>/setscore 55</code>",
+        "<b>Modifier :</b>\n<code>/setmarge EUR 40</code>\n<code>/setmarge CAD 60</code>\n"
+        "<code>/setroi 20</code>\n<code>/setscore 55</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -427,24 +469,30 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
 async def set_margin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    if len(context.args) != 1:
-        await update.effective_message.reply_text("Exemple : <code>/setmarge 40</code>", parse_mode=ParseMode.HTML)
+    if len(context.args) != 2:
+        await update.effective_message.reply_text("Exemple : <code>/setmarge EUR 40</code>", parse_mode=ParseMode.HTML)
         return
+    currency = context.args[0].upper()
     try:
-        value = parse_decimal(context.args[0])
+        value = parse_decimal(context.args[1])
+        if currency not in SUPPORTED_CURRENCIES:
+            raise ValueError
     except ValueError:
-        await update.effective_message.reply_text("❌ Entre un montant positif.")
+        await update.effective_message.reply_text("❌ Utilise EUR ou CAD et un montant positif.")
         return
     settings = get_settings(context)
-    settings["min_profit_eur"] = value
-    await update.effective_message.reply_text(f"✅ Marge minimale réglée à {money(value)}.")
+    if currency == "EUR":
+        settings["min_profit_eur"] = value
+    else:
+        settings["min_profit_cad"] = value
+    await update.effective_message.reply_text(f"✅ Marge minimale {currency} réglée à {money(value, currency)}.")
 
 
 async def set_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
     if len(context.args) != 1:
-        await update.effective_message.reply_text("Exemple : <code>/setroi 25</code>", parse_mode=ParseMode.HTML)
+        await update.effective_message.reply_text("Exemple : <code>/setroi 20</code>", parse_mode=ParseMode.HTML)
         return
     try:
         value = parse_decimal(context.args[0])
@@ -459,6 +507,7 @@ async def set_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def set_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Modifie le seuil de score au-delà duquel le scan auto notifie."""
     if not await check_access(update):
         return
     if len(context.args) != 1:
@@ -480,10 +529,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
     await update.effective_message.reply_text(
         "📘 <b>Guide</b>\n\n"
-        "<b>Analyse complète</b>\n<code>/analyse achat revente réparation livraison autres frais% risque%</code>\n\n"
-        "<b>Analyse simplifiée</b>\n<code>/simple achat revente réparation livraison</code>\n\n"
-        "<b>Enchère maximale</b>\n<code>/enchere revente réparation livraison autres frais% risque%</code>\n\n"
-        "<b>Comparer</b>\n<code>/compare achat1 revente1 achat2 revente2 frais% risque%</code>\n\n"
+        "<b>Analyse complète</b>\n<code>/analyse achat revente réparation livraison autres frais% risque% devise</code>\n\n"
+        "<b>Analyse simplifiée</b>\n<code>/simple achat revente réparation livraison devise</code>\n\n"
+        "<b>Enchère maximale</b>\n<code>/enchere revente réparation livraison autres frais% risque% devise</code>\n\n"
+        "<b>Comparer</b>\n<code>/compare achat1 revente1 achat2 revente2 frais% risque% devise</code>\n\n"
         "<b>Menu complet :</b> /menu",
         parse_mode=ParseMode.HTML,
         reply_markup=analysis_keyboard(),
@@ -499,11 +548,13 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.answer()
 
     if query.data == "help":
-        await query.message.reply_text("<code>/analyse 25 90 0 3.5 2 0 5</code>", parse_mode=ParseMode.HTML)
+        await query.message.reply_text("<code>/analyse 38 120 0 4.15 3 13 5 EUR</code>", parse_mode=ParseMode.HTML)
     elif query.data == "settings":
         await settings_command(update, context)
-    elif query.data == "example":
-        await query.message.reply_text("<code>/analyse 25 90 0 3.5 2 0 5</code>", parse_mode=ParseMode.HTML)
+    elif query.data == "example_eur":
+        await query.message.reply_text("<code>/analyse 38 120 0 4.15 3 13 5 EUR</code>", parse_mode=ParseMode.HTML)
+    elif query.data == "example_cad":
+        await query.message.reply_text("<code>/analyse 80 180 20 15 5 13 5 CAD</code>", parse_mode=ParseMode.HTML)
     elif query.data == "menu_scan":
         await query.message.reply_text("🔎 Scan manuel lancé, un instant...")
         await run_scan_cycle(context, manual=True, reply_message=query.message)
@@ -521,15 +572,17 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await query.message.reply_text(
             f"⏱ Fréquence de scan : toutes les <b>{CYCLE_SECONDS // 60} min</b>\n"
             "Modifiable via la variable d'environnement <code>CYCLE_SECONDS</code> sur Railway "
-            "(redéploiement nécessaire).",
+            "(redéploiement nécessaire — le planificateur est fixé au démarrage).",
             parse_mode=ParseMode.HTML,
         )
     elif query.data == "menu_zone":
         await query.message.reply_text(
-            "📍 Zone : France entière (Vinted FR)\n"
-            "Pas de filtre géographique ni d'ancienneté pour cette source "
-            "(la recherche catalogue Vinted n'expose ni coordonnées ni date "
-            "de publication précises).",
+            f"📍 Zone Facebook Marketplace : <b>{FACEBOOK_MARKETPLACE_CITY}</b>, rayon <b>{MAX_DISTANCE_KM} km</b>\n"
+            f"Localisation inconnue acceptée : {'oui' if ACCEPT_UNKNOWN_LOCATION else 'non'}\n"
+            f"Ancienneté max : {MAX_LISTING_AGE_HOURS}h (date inconnue acceptée : "
+            f"{'oui' if ACCEPT_UNKNOWN_DATE else 'non'})\n\n"
+            "📍 Zone Vinted : France entière (pas de filtre géographique ni d'ancienneté "
+            "pour cette source).",
             parse_mode=ParseMode.HTML,
         )
     elif query.data == "menu_history":
@@ -605,7 +658,7 @@ async def send_history(message) -> None:
     for row in rows:
         lines.append(
             f"• {row.get('model') or '?'} — score {row.get('score')} — "
-            f"{row.get('estimated_margin_eur')} €"
+            f"{row.get('estimated_margin_cad')} $ CA"
         )
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
@@ -630,6 +683,12 @@ async def handle_listing_feedback(query, context: ContextTypes.DEFAULT_TYPE) -> 
     await query.message.reply_text(f"Merci, noté : {labels.get(feedback, feedback)}")
 
 
+async def unknown_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    await update.effective_message.reply_text("Commande inconnue. Envoie /menu ou /aide.")
+
+
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
     LOGGER.exception("Erreur pendant le traitement d'une mise à jour", exc_info=context.error)
     BOT_STATE["last_error"] = str(context.error)
@@ -645,6 +704,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ---------------------------------------------------------
 
 def _format_listing_age(posted_at_iso: str | None) -> str:
+    """Traduit posted_at (ISO ou None) en texte lisible. Une date inconnue
+    reste explicitement signalée comme telle — jamais devinée."""
     if not posted_at_iso:
         return "date de publication inconnue"
     try:
@@ -661,12 +722,14 @@ def _format_listing_age(posted_at_iso: str | None) -> str:
 
 
 def _format_score_breakdown(breakdown: dict) -> list[str]:
+    """Rend explicite comment le score a été calculé, pour ne jamais
+    laisser le score comme une boîte noire dans la notification."""
     if not breakdown:
         return []
     if breakdown.get("reason") == "incomplete_estimation_potential_score":
         return [
             f"<i>Score de potentiel (pas encore de ventes réelles pour ce modèle/état) "
-            f"— basé sur le prix affiché ({breakdown.get('listing_price_eur')} €), "
+            f"— basé sur le prix affiché ({breakdown.get('listing_price_cad')} $ CA), "
             f"état : {breakdown.get('condition')}</i>"
         ]
     if "margin_score" not in breakdown:
@@ -688,19 +751,19 @@ def _format_score_breakdown(breakdown: dict) -> list[str]:
 def _format_deal_message(listing: dict) -> str:
     n = listing.get("normalized", {})
     e = listing.get("estimation", {})
-    price = e.get("listing_price_eur")
-    resale = e.get("estimated_resale_eur")
-    repair = e.get("estimated_repair_eur")
-    margin = e.get("margin_eur")
+    price = e.get("listing_price_cad")
+    resale = e.get("estimated_resale_cad")
+    repair = e.get("estimated_repair_cad")
+    margin = e.get("margin_cad")
     roi = e.get("roi_pct")
 
     lines = [f"🔥 <b>Score {listing.get('score')}/100</b>\n"]
     lines.append(f"<b>{n.get('model') or '?'}</b> — {n.get('condition')}")
-    lines.append(f"Prix annonce : {price} €")
+    lines.append(f"Prix annonce : {price} $ CA")
     if resale is not None:
-        lines.append(f"Revente estimée : {resale} €")
-        lines.append(f"Réparation estimée : {repair} €")
-        lines.append(f"Marge estimée : <b>{margin} €</b> · ROI {roi}%")
+        lines.append(f"Revente estimée : {resale} $ CA")
+        lines.append(f"Réparation estimée : {repair} $ CA")
+        lines.append(f"Marge estimée : <b>{margin} $ CA</b> · ROI {roi}%")
     else:
         lines.append("ℹ️ Pas encore assez de ventes réelles pour ce modèle — score de potentiel.")
 
@@ -726,10 +789,13 @@ def _listing_keyboard(listing_id: str, url: str) -> InlineKeyboardMarkup:
 
 
 # ---------------------------------------------------------
-# CYCLE DE SCAN
+# CYCLE DE SCAN — utilisé par le scan auto ET le scan manuel
 # ---------------------------------------------------------
 
 async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = False, reply_message=None) -> dict:
+    """Exécute un cycle complet : sources -> filtre pertinence -> estimation
+    -> score -> stockage -> notification. Protégé par SCAN_LOCK pour éviter
+    tout chevauchement entre scan auto et scan manuel."""
     if SCAN_LOCK.locked():
         if reply_message:
             await reply_message.reply_text("⏳ Un scan est déjà en cours, réessaie dans un instant.")
@@ -793,6 +859,9 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                         counters["duplicates"] += 1
                         continue
 
+                    # Garde-fou final explicite avant tout envoi Telegram :
+                    # ne jamais envoyer autre chose qu'un iPhone complet,
+                    # même si une étape en amont a mal classé l'annonce.
                     if listing.get("relevance", {}).get("listing_type") != "whole_phone":
                         continue
 
@@ -826,7 +895,7 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                     f"Rejetées — accessoires : {counters['rejected_accessory']}, "
                     f"pièces : {counters['rejected_parts']}, services : {counters['rejected_service']}, "
                     f"acheteurs : {counters['rejected_buyer']}, autres marques : {counters['rejected_other_brand']}, "
-                    f"catalogues : {counters['rejected_catalog']}\n"
+                    f"catalogues : {counters['rejected_catalog']}, ambiguës : {counters['rejected_ambiguous']}\n"
                     f"Trop vieilles : {counters['rejected_too_old']} · Trop loin : {counters['rejected_too_far']}"
                 ),
                 parse_mode=ParseMode.HTML,
@@ -840,6 +909,7 @@ async def scan_job(context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def scan_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Commande /scan — déclenche un scan manuel immédiat."""
     if not await check_access(update):
         return
     await update.effective_message.reply_text("🔎 Scan manuel lancé, un instant...")
@@ -895,12 +965,13 @@ def main() -> None:
     application.add_handler(CommandHandler("aide", help_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_handler))
+    application.add_handler(CommandHandler(["test", "calcul", "profit"], help_command))
 
     application.add_error_handler(error_handler)
 
     application.job_queue.run_repeating(scan_job, interval=CYCLE_SECONDS, first=15)
 
-    LOGGER.info("Bot Vinted démarré. Scan auto toutes les %ds.", CYCLE_SECONDS)
+    LOGGER.info("Bot de rentabilité démarré. Scan auto toutes les %ds.", CYCLE_SECONDS)
 
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
