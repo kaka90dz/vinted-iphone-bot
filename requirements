@@ -1,0 +1,4 @@
+python-telegram-bot[job-queue]==21.6
+psycopg2-binary==2.9.12
+vinted-scraper
+anthropic==0.120.2
