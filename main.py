@@ -59,9 +59,10 @@ DEFAULT_SETTINGS: Final[dict[str, Decimal]] = {
 MONEY_STEP: Final[Decimal] = Decimal("0.01")
 PERCENT_STEP: Final[Decimal] = Decimal("0.1")
 
-# Vinted n'offre pas de webhook temps réel : un scan très rapproché
-# (60s) est l'équivalent le plus proche d'une notification instantanée
-# dès qu'une annonce est mise en ligne.
+# Vinted n'offre pas de webhook temps réel pour un scraper non-authentifié :
+# un scan très rapproché (60s) est l'équivalent le plus proche d'une
+# notification instantanée dès qu'une annonce est mise en ligne, sans
+# dépendre d'un service payant (voir échange du 5 août sur les alternatives).
 CYCLE_SECONDS: Final[int] = int(os.getenv("CYCLE_SECONDS", "60"))
 SOURCES = [fetch_vinted]
 SOURCE_STATS_GETTERS = {fetch_vinted: get_vinted_stats}
@@ -221,9 +222,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 <b>Bot Vinted iPhone</b>\n\n"
         "<b>Calculateur :</b> /analyse, /simple, /enchere, /compare, /reglages\n"
         "<b>Menu :</b> /menu\n\n"
-        "🔎 Le scan automatique Vinted tourne en tâche de fond et envoie "
-        "toutes les annonces de téléphones complets dès qu'elles sont "
-        "détectées — jamais d'étuis, pièces, kits ou services."
+        "🔎 Le scan automatique Vinted tourne en tâche de fond (toutes les "
+        f"{CYCLE_SECONDS}s) et envoie toutes les annonces de téléphones "
+        "complets — jamais d'étuis, pièces, kits ou services."
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -544,6 +545,7 @@ async def send_bot_state(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     await message.reply_text(
         "📊 <b>État du bot</b>\n\n"
         f"Catégorie active : {get_current_category_label()}\n"
+        f"Fréquence de scan : toutes les {CYCLE_SECONDS}s\n"
         f"Dernier scan — trouvées : {BOT_STATE['last_found']}\n"
         f"Dernier scan — envoyées : {BOT_STATE['last_sent']}\n"
         f"Dernier scan — doublons : {BOT_STATE['last_duplicates']}\n"
@@ -619,7 +621,8 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------
-# NOTIFICATION D'UNE ANNONCE (format façon Discord, sans score)
+# NOTIFICATION D'UNE ANNONCE — format façon Discord, avec les vraies
+# données disponibles (pas de note inventée, pas de TTC estimé au hasard)
 # ---------------------------------------------------------
 
 def _format_listing_age(posted_at_iso: str | None) -> str:
@@ -638,6 +641,9 @@ def _format_listing_age(posted_at_iso: str | None) -> str:
     return f"il y a {hours / 24:.1f} j"
 
 
+# Repli utilisé UNIQUEMENT si Vinted n'a pas fourni de texte d'état
+# (vinted_status vide) — dans ce cas on retombe sur notre propre
+# classification interne, faite à partir du titre de l'annonce.
 _CONDITION_LABELS = {
     "icloud_locked": "iCloud verrouillé",
     "water_damage": "Dégâts d'eau",
@@ -656,15 +662,30 @@ def _format_deal_message(listing: dict) -> str:
     n = listing.get("normalized", {})
     e = listing.get("estimation", {})
     price = e.get("listing_price_eur")
-    condition_label = _CONDITION_LABELS.get(n.get("condition", "unknown"), "État non précisé")
+
+    # Priorité au texte d'état RÉEL fourni par Vinted (ex: "Très bon état").
+    # Si absent, on retombe sur notre classification interne (titre analysé).
+    vinted_status = listing.get("vinted_status")
+    condition_label = vinted_status or _CONDITION_LABELS.get(
+        n.get("condition", "unknown"), "État non précisé"
+    )
+
+    storage = n.get("storage_gb")
+    vinted_size = listing.get("vinted_size")
+    storage_label = f"{storage} Go" if storage else (vinted_size or "Non précisé")
+
+    seller_login = listing.get("seller_login")
 
     lines = [
         f"📱 <b>{n.get('model') or listing.get('title', '?')}</b>\n",
         f"⏳ <b>Publié</b>\n{_format_listing_age(listing.get('posted_at'))}\n",
         f"🏷️ <b>Marque</b>\nApple\n",
+        f"📦 <b>Stockage</b>\n{storage_label}\n",
         f"💎 <b>État</b>\n{condition_label}\n",
         f"💰 <b>Prix</b>\n{price} €" if price is not None else "💰 <b>Prix</b>\nnon précisé",
     ]
+    if seller_login:
+        lines.append(f"\n👤 {seller_login}")
     return "\n".join(lines)
 
 
