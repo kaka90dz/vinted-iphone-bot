@@ -12,6 +12,19 @@ La catégorie active est un état en mémoire du process (set_category),
 lue à chaque appel de fetch() — donc un changement de catégorie
 s'applique aussi bien au prochain scan manuel qu'au prochain scan
 automatique planifié, sans redémarrage du bot.
+
+Champs supplémentaires extraits par rapport aux versions précédentes :
+    - status : le texte d'état RÉEL fourni par Vinted (ex: "Très bon état"),
+      distinct de notre propre classification interne (cracked_screen,
+      battery_issue, etc.) faite dans pipeline/normalize.py à partir du titre.
+    - size_title : utilisé ici comme indicateur de stockage/variante si
+      renseigné par le vendeur (rarement rempli pour des téléphones,
+      Vinted étant avant tout un site de vêtements — peut être vide).
+    - seller_login : pseudo du vendeur, pour affichage uniquement.
+
+Tous ces champs sont lus avec getattr(..., None) : s'ils n'existent pas
+sur l'objet retourné par la lib (selon la version, ou si Vinted ne les a
+pas fournis pour cette annonce), on obtient None sans planter.
 """
 
 import os
@@ -58,8 +71,6 @@ CATEGORY_LABELS = {
     "all": "Tous les iPhone",
 }
 
-# État en mémoire — persiste tant que le process tourne, remis à
-# "broken" à chaque redémarrage du bot (redéploiement Railway inclus).
 _current_category = "broken"
 
 
@@ -164,6 +175,24 @@ class VintedSource:
 
         photo = getattr(item, "photo", None)
 
+        # État réel Vinted (texte du vendeur, ex: "Très bon état") — distinct
+        # de notre propre classification interne faite sur le titre dans
+        # pipeline/normalize.py. Peut être None selon les versions de la lib.
+        vinted_status = getattr(item, "status", None)
+
+        # Rarement rempli pour des téléphones (Vinted = vêtements avant
+        # tout), mais on le récupère si présent.
+        size_title = getattr(item, "size_title", None)
+
+        # Pseudo vendeur, pour affichage uniquement (peut être un objet
+        # imbriqué selon la version de la lib -> on tente .login sinon None).
+        seller_login = None
+        user_obj = getattr(item, "user", None)
+        if user_obj is not None:
+            seller_login = getattr(user_obj, "login", None)
+            if seller_login is None and isinstance(user_obj, dict):
+                seller_login = user_obj.get("login")
+
         return {
             "source": self.name,
             "source_search_query": search.get("query", ""),
@@ -176,13 +205,13 @@ class VintedSource:
             "photos": [photo] if photo else [],
             "posted_at": None,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
+            "vinted_status": vinted_status,
+            "vinted_size": size_title,
+            "seller_login": seller_login,
         }
 
 
 def fetch() -> list[dict]:
-    # self.searches est recalculé à chaque instanciation depuis
-    # _current_category, donc un changement de catégorie via
-    # set_category() s'applique dès le prochain appel à fetch().
     source = VintedSource()
     return source.fetch()
 
