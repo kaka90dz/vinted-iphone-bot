@@ -1,21 +1,17 @@
 """
 sources/vinted.py
 
-Récupère les annonces Vinted (France) via la lib `vinted-scraper`
-(maintenue activement, contrairement à `pyVinted` qui est abandonné
-depuis 2022 et incompatible avec Python 3.13).
+Récupère les annonces Vinted (France) via la lib `vinted-scraper`.
 
-Interface commune attendue par le pipeline : fetch() -> list[dict]
+Deux catégories de recherche, sélectionnables depuis le menu Telegram
+(voir main.py) :
+    - "broken" (défaut) : iPhone cassés, bloqués iCloud, pour pièces
+    - "all"             : tous les iPhone, sans restriction d'état
 
-Différences à garder en tête :
-- Pas de coordonnées GPS précises par annonce -> pas de filtre
-  géographique ; Vinted FR est un marché national.
-- La recherche catalogue ne renvoie pas de date de publication -> on
-  laisse posted_at à None systématiquement.
-- Une seule photo (item.photo) exposée par la recherche catalogue.
-- La description complète n'est pas dans les résultats de recherche
-  (seulement dans la page détail de l'annonce) ; on la laisse vide ici
-  pour rester rapide.
+La catégorie active est un état en mémoire du process (set_category),
+lue à chaque appel de fetch() — donc un changement de catégorie
+s'applique aussi bien au prochain scan manuel qu'au prochain scan
+automatique planifié, sans redémarrage du bot.
 """
 
 import os
@@ -31,7 +27,7 @@ VINTED_BASE_URL = os.environ.get("VINTED_BASE_URL", "https://www.vinted.fr")
 VINTED_PRICE_MAX = os.environ.get("VINTED_PRICE_MAX")  # optionnel, en EUR
 VINTED_RESULTS_PER_SEARCH = int(os.environ.get("VINTED_RESULTS_PER_SEARCH", "20"))
 
-DEFAULT_SEARCHES = [
+BROKEN_SEARCHES = [
     {"query": "iphone cassé"},
     {"query": "iphone écran fissuré"},
     {"query": "iphone hs"},
@@ -39,6 +35,47 @@ DEFAULT_SEARCHES = [
     {"query": "iphone ne s'allume plus"},
     {"query": "iphone icloud"},
 ]
+
+ALL_SEARCHES = [
+    {"query": "iphone 11"},
+    {"query": "iphone 12"},
+    {"query": "iphone 13"},
+    {"query": "iphone 14"},
+    {"query": "iphone 15"},
+    {"query": "iphone 16"},
+    {"query": "iphone se"},
+    {"query": "iphone xr"},
+    {"query": "iphone xs"},
+]
+
+CATEGORIES = {
+    "broken": BROKEN_SEARCHES,
+    "all": ALL_SEARCHES,
+}
+
+CATEGORY_LABELS = {
+    "broken": "iPhone cassé / bloqué / pour pièces",
+    "all": "Tous les iPhone",
+}
+
+# État en mémoire — persiste tant que le process tourne, remis à
+# "broken" à chaque redémarrage du bot (redéploiement Railway inclus).
+_current_category = "broken"
+
+
+def set_category(category: str) -> None:
+    global _current_category
+    if category not in CATEGORIES:
+        raise ValueError(f"Catégorie inconnue: {category}")
+    _current_category = category
+
+
+def get_current_category() -> str:
+    return _current_category
+
+
+def get_current_category_label() -> str:
+    return CATEGORY_LABELS.get(_current_category, _current_category)
 
 
 class ScanStats:
@@ -71,7 +108,7 @@ class VintedSource:
 
     def __init__(self, searches: Optional[list] = None):
         self.scraper = VintedScraper(VINTED_BASE_URL)
-        self.searches = searches or DEFAULT_SEARCHES
+        self.searches = searches or CATEGORIES[_current_category]
 
     def _build_params(self, search: dict) -> dict:
         params = {
@@ -91,7 +128,7 @@ class VintedSource:
 
         for search in self.searches:
             params = self._build_params(search)
-            logger.info("Recherche Vinted: %s", params)
+            logger.info("Recherche Vinted [%s]: %s", _current_category, params)
 
             try:
                 items = self.scraper.search(params)
@@ -116,7 +153,7 @@ class VintedSource:
                     all_listings.append(listing)
 
         _last_stats = stats
-        logger.info("Scan source Vinted terminé: %s", stats.as_dict())
+        logger.info("Scan source Vinted terminé [%s]: %s", _current_category, stats.as_dict())
         return all_listings
 
     def _format(self, item, search: dict) -> Optional[dict]:
@@ -143,6 +180,9 @@ class VintedSource:
 
 
 def fetch() -> list[dict]:
+    # self.searches est recalculé à chaque instanciation depuis
+    # _current_category, donc un changement de catégorie via
+    # set_category() s'applique dès le prochain appel à fetch().
     source = VintedSource()
     return source.fetch()
 
