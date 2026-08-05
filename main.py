@@ -21,7 +21,12 @@ from telegram.ext import (
     PicklePersistence,
 )
 
-from sources.vinted import fetch as fetch_vinted, get_last_stats as get_vinted_stats
+from sources.vinted import (
+    fetch as fetch_vinted,
+    get_last_stats as get_vinted_stats,
+    set_category,
+    get_current_category_label,
+)
 from pipeline.normalize import normalize_listing, USE_ANTHROPIC_NORMALIZER
 import pipeline.normalize as normalize_module
 from pipeline.estimate import estimate_listing
@@ -54,7 +59,10 @@ DEFAULT_SETTINGS: Final[dict[str, Decimal]] = {
 MONEY_STEP: Final[Decimal] = Decimal("0.01")
 PERCENT_STEP: Final[Decimal] = Decimal("0.1")
 
-CYCLE_SECONDS: Final[int] = int(os.getenv("CYCLE_SECONDS", "900"))
+# Vinted n'offre pas de webhook temps réel : un scan très rapproché
+# (60s) est l'équivalent le plus proche d'une notification instantanée
+# dès qu'une annonce est mise en ligne.
+CYCLE_SECONDS: Final[int] = int(os.getenv("CYCLE_SECONDS", "60"))
 SOURCES = [fetch_vinted]
 SOURCE_STATS_GETTERS = {fetch_vinted: get_vinted_stats}
 
@@ -69,7 +77,7 @@ BOT_STATE = {
 
 
 # ---------------------------------------------------------
-# OUTILS CALCULATEUR (inchangés, indépendants du scan)
+# OUTILS CALCULATEUR (commandes conservées, plus dans le menu)
 # ---------------------------------------------------------
 
 def parse_decimal(value: str) -> Decimal:
@@ -153,7 +161,7 @@ def verdict_for(profit, roi, safe_profit, target, min_roi) -> str:
 
 def analysis_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
-        [InlineKeyboardButton("📘 Aide", callback_data="help"),
+        [InlineKeyboardButton("📘 Aide", callback_data="help_quick"),
          InlineKeyboardButton("⚙️ Réglages", callback_data="settings")],
         [InlineKeyboardButton("🧮 Exemple", callback_data="example")],
     ])
@@ -202,9 +210,8 @@ def build_analysis(*, purchase_price, resale_price, repair_cost, shipping_in, ot
 
 
 # ---------------------------------------------------------
-# COMMANDES CALCULATEUR (inchangées — le calculateur manuel garde son
-# propre score interne pour /analyse, /simple, etc., indépendant du
-# scan automatique qui n'utilise plus aucun score)
+# COMMANDES CALCULATEUR (toujours utilisables en tapant la commande,
+# retirées du menu à boutons)
 # ---------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -213,12 +220,12 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🤖 <b>Bot Vinted iPhone</b>\n\n"
         "<b>Calculateur :</b> /analyse, /simple, /enchere, /compare, /reglages\n"
-        "<b>Menu complet :</b> /menu\n\n"
+        "<b>Menu :</b> /menu\n\n"
         "🔎 Le scan automatique Vinted tourne en tâche de fond et envoie "
-        "toutes les annonces de téléphones complets — jamais d'étuis, "
-        "pièces, kits ou services."
+        "toutes les annonces de téléphones complets dès qu'elles sont "
+        "détectées — jamais d'étuis, pièces, kits ou services."
     )
-    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=analysis_keyboard())
+    await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
 
 async def analyse(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -409,8 +416,8 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "(0% par défaut — Vinted ne facture rien au vendeur)\n"
         f"Réserve de risque par défaut : {percent(settings['default_risk_percent'])}\n"
         f"Scénario prudent : {percent(settings['safety_resale_percent'])} du prix de revente\n\n"
-        f"Fréquence de scan : toutes les {CYCLE_SECONDS // 60} min\n"
-        "(le scan automatique envoie toutes les annonces trouvées, sans filtre de score)\n\n"
+        f"Catégorie de recherche active : {get_current_category_label()}\n"
+        f"Fréquence de scan : toutes les {CYCLE_SECONDS} s\n\n"
         "<b>Modifier :</b>\n<code>/setmarge 40</code>\n<code>/setroi 25</code>",
         parse_mode=ParseMode.HTML,
     )
@@ -459,9 +466,10 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Analyse simplifiée</b>\n<code>/simple achat revente réparation livraison</code>\n\n"
         "<b>Enchère maximale</b>\n<code>/enchere revente réparation livraison autres frais% risque%</code>\n\n"
         "<b>Comparer</b>\n<code>/compare achat1 revente1 achat2 revente2 frais% risque%</code>\n\n"
-        "<b>Menu complet :</b> /menu",
+        "<b>Réglages</b>\n<code>/reglages</code> · <code>/setmarge 40</code> · <code>/setroi 25</code>\n\n"
+        "<b>Scan</b>\n<code>/scan</code> lance un scan manuel immédiat\n\n"
+        "<b>Menu :</b> /menu",
         parse_mode=ParseMode.HTML,
-        reply_markup=analysis_keyboard(),
     )
 
 
@@ -473,7 +481,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         return
     await query.answer()
 
-    if query.data == "help":
+    if query.data == "help_quick":
         await query.message.reply_text("<code>/analyse 25 90 0 3.5 2 0 5</code>", parse_mode=ParseMode.HTML)
     elif query.data == "settings":
         await settings_command(update, context)
@@ -486,21 +494,24 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send_bot_state(query.message, context)
     elif query.data == "menu_filters":
         await send_filters_summary(query.message)
-    elif query.data == "menu_frequency":
-        await query.message.reply_text(
-            f"⏱ Fréquence de scan : toutes les <b>{CYCLE_SECONDS // 60} min</b>\n"
-            "Modifiable via la variable d'environnement <code>CYCLE_SECONDS</code> sur Railway "
-            "(redéploiement nécessaire).",
-            parse_mode=ParseMode.HTML,
-        )
-    elif query.data == "menu_zone":
-        await query.message.reply_text(
-            "📍 Zone : France entière (Vinted FR)\n"
-            "Pas de filtre géographique ni d'ancienneté pour cette source.",
-            parse_mode=ParseMode.HTML,
-        )
     elif query.data == "menu_history":
         await send_history(query.message)
+    elif query.data == "cat_broken":
+        set_category("broken")
+        await query.message.reply_text(
+            "📱 Catégorie réglée sur : <b>iPhone cassé / bloqué / pour pièces</b>\n"
+            "Scan lancé sur cette catégorie...",
+            parse_mode=ParseMode.HTML,
+        )
+        await run_scan_cycle(context, manual=True, reply_message=query.message)
+    elif query.data == "cat_all":
+        set_category("all")
+        await query.message.reply_text(
+            "📦 Catégorie réglée sur : <b>Tous les iPhone</b>\n"
+            "Scan lancé sur cette catégorie...",
+            parse_mode=ParseMode.HTML,
+        )
+        await run_scan_cycle(context, manual=True, reply_message=query.message)
     elif query.data.startswith("fb:"):
         await handle_listing_feedback(query, context)
 
@@ -509,9 +520,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup([
         [InlineKeyboardButton("🔎 Scanner maintenant", callback_data="menu_scan"),
          InlineKeyboardButton("📊 État du bot", callback_data="menu_state")],
+        [InlineKeyboardButton("📱 Cassé/bloqué/pièces", callback_data="cat_broken"),
+         InlineKeyboardButton("📦 Tous les iPhone", callback_data="cat_all")],
         [InlineKeyboardButton("🧰 Filtres", callback_data="menu_filters"),
-         InlineKeyboardButton("⏱ Fréquence", callback_data="menu_frequency")],
-        [InlineKeyboardButton("📍 Zone", callback_data="menu_zone"),
          InlineKeyboardButton("🕘 Historique", callback_data="menu_history")],
     ])
 
@@ -520,7 +531,9 @@ async def menu_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not await check_access(update):
         return
     await update.effective_message.reply_text(
-        "📋 <b>Menu</b>", parse_mode=ParseMode.HTML, reply_markup=main_menu_keyboard()
+        f"📋 <b>Menu</b>\nCatégorie active : <b>{get_current_category_label()}</b>",
+        parse_mode=ParseMode.HTML,
+        reply_markup=main_menu_keyboard(),
     )
 
 
@@ -530,6 +543,7 @@ async def send_bot_state(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     )
     await message.reply_text(
         "📊 <b>État du bot</b>\n\n"
+        f"Catégorie active : {get_current_category_label()}\n"
         f"Dernier scan — trouvées : {BOT_STATE['last_found']}\n"
         f"Dernier scan — envoyées : {BOT_STATE['last_sent']}\n"
         f"Dernier scan — doublons : {BOT_STATE['last_duplicates']}\n"
@@ -552,6 +566,7 @@ async def send_filters_summary(message) -> None:
         f"Pièces/kits : {len(PARTS_PATTERNS)} règles\n"
         f"Catalogues : {len(CATALOG_PATTERNS)} règles\n"
         f"Autres marques : {len(OTHER_BRAND_PATTERNS)} règles\n\n"
+        f"Catégorie de recherche active : {get_current_category_label()}\n"
         "Seuls les téléphones complets (whole_phone) sont envoyés — aucun filtre de score.",
         parse_mode=ParseMode.HTML,
     )
@@ -768,7 +783,7 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
             await context.bot.send_message(
                 chat_id=ALLOWED_CHAT_ID,
                 text=(
-                    "✅ <b>Scan manuel terminé</b>\n\n"
+                    "✅ <b>Scan terminé</b>\n\n"
                     f"Trouvées : {counters['found_raw']} · Envoyées : {counters['sent']} · "
                     f"Doublons : {counters['duplicates']}\n"
                     f"Rejetées — accessoires : {counters['rejected_accessory']}, "
@@ -846,7 +861,7 @@ def main() -> None:
 
     application.job_queue.run_repeating(scan_job, interval=CYCLE_SECONDS, first=15)
 
-    LOGGER.info("Bot Vinted démarré (sans filtre de score). Scan auto toutes les %ds.", CYCLE_SECONDS)
+    LOGGER.info("Bot Vinted démarré. Scan auto toutes les %ds.", CYCLE_SECONDS)
 
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
