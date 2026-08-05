@@ -25,7 +25,6 @@ from sources.vinted import fetch as fetch_vinted, get_last_stats as get_vinted_s
 from pipeline.normalize import normalize_listing, USE_ANTHROPIC_NORMALIZER
 import pipeline.normalize as normalize_module
 from pipeline.estimate import estimate_listing
-from pipeline.score import score_listing
 from storage.db import insert_listing, get_recent_sent, get_connection
 
 
@@ -56,7 +55,6 @@ MONEY_STEP: Final[Decimal] = Decimal("0.01")
 PERCENT_STEP: Final[Decimal] = Decimal("0.1")
 
 CYCLE_SECONDS: Final[int] = int(os.getenv("CYCLE_SECONDS", "900"))
-DEFAULT_SCORE_THRESHOLD: Final[int] = int(os.getenv("SCORE_THRESHOLD", "55"))
 SOURCES = [fetch_vinted]
 SOURCE_STATS_GETTERS = {fetch_vinted: get_vinted_stats}
 
@@ -71,7 +69,7 @@ BOT_STATE = {
 
 
 # ---------------------------------------------------------
-# OUTILS CALCULATEUR
+# OUTILS CALCULATEUR (inchangés, indépendants du scan)
 # ---------------------------------------------------------
 
 def parse_decimal(value: str) -> Decimal:
@@ -204,7 +202,9 @@ def build_analysis(*, purchase_price, resale_price, repair_cost, shipping_in, ot
 
 
 # ---------------------------------------------------------
-# COMMANDES CALCULATEUR (mono-devise EUR — pas de paramètre devise)
+# COMMANDES CALCULATEUR (inchangées — le calculateur manuel garde son
+# propre score interne pour /analyse, /simple, etc., indépendant du
+# scan automatique qui n'utilise plus aucun score)
 # ---------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -214,9 +214,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "🤖 <b>Bot Vinted iPhone</b>\n\n"
         "<b>Calculateur :</b> /analyse, /simple, /enchere, /compare, /reglages\n"
         "<b>Menu complet :</b> /menu\n\n"
-        "🔎 Le scan automatique Vinted tourne en tâche de fond et n'envoie "
-        "que des annonces de téléphones complets — jamais d'étuis, pièces, "
-        "kits ou services."
+        "🔎 Le scan automatique Vinted tourne en tâche de fond et envoie "
+        "toutes les annonces de téléphones complets — jamais d'étuis, "
+        "pièces, kits ou services."
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML, reply_markup=analysis_keyboard())
 
@@ -401,7 +401,6 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if not await check_access(update):
         return
     settings = get_settings(context)
-    threshold = context.bot_data.get("score_threshold", DEFAULT_SCORE_THRESHOLD)
     await update.effective_message.reply_text(
         "⚙️ <b>Tes réglages</b>\n\n"
         f"Marge minimale : {money(settings['min_profit_eur'])}\n"
@@ -410,10 +409,9 @@ async def settings_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         "(0% par défaut — Vinted ne facture rien au vendeur)\n"
         f"Réserve de risque par défaut : {percent(settings['default_risk_percent'])}\n"
         f"Scénario prudent : {percent(settings['safety_resale_percent'])} du prix de revente\n\n"
-        f"Seuil de score scan auto : {threshold}/100\n"
-        f"Fréquence de scan : toutes les {CYCLE_SECONDS // 60} min\n\n"
-        "<b>Modifier :</b>\n<code>/setmarge 40</code>\n<code>/setroi 25</code>\n"
-        "<code>/setscore 55</code>",
+        f"Fréquence de scan : toutes les {CYCLE_SECONDS // 60} min\n"
+        "(le scan automatique envoie toutes les annonces trouvées, sans filtre de score)\n\n"
+        "<b>Modifier :</b>\n<code>/setmarge 40</code>\n<code>/setroi 25</code>",
         parse_mode=ParseMode.HTML,
     )
 
@@ -452,23 +450,6 @@ async def set_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"✅ ROI minimum réglé à {percent(value)}.")
 
 
-async def set_score(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if not await check_access(update):
-        return
-    if len(context.args) != 1:
-        await update.effective_message.reply_text("Exemple : <code>/setscore 55</code>", parse_mode=ParseMode.HTML)
-        return
-    try:
-        value = int(context.args[0])
-        if not (0 <= value <= 100):
-            raise ValueError
-    except ValueError:
-        await update.effective_message.reply_text("❌ Entre un entier entre 0 et 100.")
-        return
-    context.bot_data["score_threshold"] = value
-    await update.effective_message.reply_text(f"✅ Seuil de score scan auto réglé à {value}/100.")
-
-
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
@@ -505,12 +486,6 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await send_bot_state(query.message, context)
     elif query.data == "menu_filters":
         await send_filters_summary(query.message)
-    elif query.data == "menu_score":
-        threshold = context.bot_data.get("score_threshold", DEFAULT_SCORE_THRESHOLD)
-        await query.message.reply_text(
-            f"🎯 Seuil de score actuel : <b>{threshold}/100</b>\nModifier : <code>/setscore 60</code>",
-            parse_mode=ParseMode.HTML,
-        )
     elif query.data == "menu_frequency":
         await query.message.reply_text(
             f"⏱ Fréquence de scan : toutes les <b>{CYCLE_SECONDS // 60} min</b>\n"
@@ -521,9 +496,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     elif query.data == "menu_zone":
         await query.message.reply_text(
             "📍 Zone : France entière (Vinted FR)\n"
-            "Pas de filtre géographique ni d'ancienneté pour cette source "
-            "(la recherche catalogue Vinted n'expose ni coordonnées ni date "
-            "de publication précises).",
+            "Pas de filtre géographique ni d'ancienneté pour cette source.",
             parse_mode=ParseMode.HTML,
         )
     elif query.data == "menu_history":
@@ -537,10 +510,9 @@ def main_menu_keyboard() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔎 Scanner maintenant", callback_data="menu_scan"),
          InlineKeyboardButton("📊 État du bot", callback_data="menu_state")],
         [InlineKeyboardButton("🧰 Filtres", callback_data="menu_filters"),
-         InlineKeyboardButton("🎯 Score minimum", callback_data="menu_score")],
-        [InlineKeyboardButton("⏱ Fréquence", callback_data="menu_frequency"),
-         InlineKeyboardButton("📍 Zone", callback_data="menu_zone")],
-        [InlineKeyboardButton("🕘 Historique", callback_data="menu_history")],
+         InlineKeyboardButton("⏱ Fréquence", callback_data="menu_frequency")],
+        [InlineKeyboardButton("📍 Zone", callback_data="menu_zone"),
+         InlineKeyboardButton("🕘 Historique", callback_data="menu_history")],
     ])
 
 
@@ -580,7 +552,7 @@ async def send_filters_summary(message) -> None:
         f"Pièces/kits : {len(PARTS_PATTERNS)} règles\n"
         f"Catalogues : {len(CATALOG_PATTERNS)} règles\n"
         f"Autres marques : {len(OTHER_BRAND_PATTERNS)} règles\n\n"
-        "Seuls les téléphones complets (whole_phone) passent au scoring.",
+        "Seuls les téléphones complets (whole_phone) sont envoyés — aucun filtre de score.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -597,10 +569,7 @@ async def send_history(message) -> None:
         return
     lines = ["🕘 <b>Dernières annonces envoyées</b>\n"]
     for row in rows:
-        lines.append(
-            f"• {row.get('model') or '?'} — score {row.get('score')} — "
-            f"{row.get('estimated_margin_eur')} €"
-        )
+        lines.append(f"• {row.get('model') or '?'} — {row.get('estimated_margin_eur')} €")
     await message.reply_text("\n".join(lines), parse_mode=ParseMode.HTML)
 
 
@@ -635,7 +604,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------
-# NOTIFICATION D'UNE BONNE AFFAIRE
+# NOTIFICATION D'UNE ANNONCE (format façon Discord, sans score)
 # ---------------------------------------------------------
 
 def _format_listing_age(posted_at_iso: str | None) -> str:
@@ -648,63 +617,39 @@ def _format_listing_age(posted_at_iso: str | None) -> str:
     age = datetime.now(timezone.utc) - posted_dt
     hours = age.total_seconds() / 3600
     if hours < 1:
-        return f"publiée il y a {int(age.total_seconds() / 60)} min"
+        return f"il y a {int(age.total_seconds() / 60)} min"
     if hours < 24:
-        return f"publiée il y a {hours:.1f} h"
-    return f"publiée il y a {hours / 24:.1f} j"
+        return f"il y a {hours:.1f} h"
+    return f"il y a {hours / 24:.1f} j"
 
 
-def _format_score_breakdown(breakdown: dict) -> list[str]:
-    if not breakdown:
-        return []
-    if breakdown.get("reason") == "incomplete_estimation_potential_score":
-        return [
-            f"<i>Score de potentiel (pas encore de ventes réelles pour ce modèle/état) "
-            f"— basé sur le prix affiché ({breakdown.get('listing_price_eur')} €), "
-            f"état : {breakdown.get('condition')}</i>"
-        ]
-    if "margin_score" not in breakdown:
-        return []
-    lines = [
-        "<i>Détail : marge {ms}/45 · ROI {rs}/30 · fiabilité estimation {ec}/15 · "
-        "fiabilité extraction {xc}/10</i>".format(
-            ms=round(breakdown.get("margin_score", 0) * 0.45, 1),
-            rs=round(breakdown.get("roi_score", 0) * 0.30, 1),
-            ec=round(breakdown.get("estimation_confidence_score", 0) * 0.15, 1),
-            xc=round(breakdown.get("extraction_confidence_score", 0) * 0.10, 1),
-        )
-    ]
-    if breakdown.get("condition_penalty_applied"):
-        lines.append("⚠️ <i>Pénalité appliquée (iCloud verrouillé ou dégâts d'eau)</i>")
-    return lines
+_CONDITION_LABELS = {
+    "icloud_locked": "iCloud verrouillé",
+    "water_damage": "Dégâts d'eau",
+    "no_power": "Ne s'allume plus",
+    "cracked_screen": "Écran fissuré",
+    "battery_issue": "Batterie à changer",
+    "charging_issue": "Port de charge défectueux",
+    "carrier_locked": "Bloqué opérateur",
+    "for_parts": "Pour pièces",
+    "functional": "Fonctionnel",
+    "unknown": "État non précisé",
+}
 
 
 def _format_deal_message(listing: dict) -> str:
     n = listing.get("normalized", {})
     e = listing.get("estimation", {})
     price = e.get("listing_price_eur")
-    resale = e.get("estimated_resale_eur")
-    repair = e.get("estimated_repair_eur")
-    margin = e.get("margin_eur")
-    roi = e.get("roi_pct")
+    condition_label = _CONDITION_LABELS.get(n.get("condition", "unknown"), "État non précisé")
 
-    lines = [f"🔥 <b>Score {listing.get('score')}/100</b>\n"]
-    lines.append(f"<b>{n.get('model') or '?'}</b> — {n.get('condition')}")
-    lines.append(f"Prix annonce : {price} €")
-    if resale is not None:
-        lines.append(f"Revente estimée : {resale} €")
-        lines.append(f"Réparation estimée : {repair} €")
-        lines.append(f"Marge estimée : <b>{margin} €</b> · ROI {roi}%")
-    else:
-        lines.append("ℹ️ Pas encore assez de ventes réelles pour ce modèle — score de potentiel.")
-
-    breakdown_lines = _format_score_breakdown(listing.get("score_breakdown", {}))
-    if breakdown_lines:
-        lines.append("")
-        lines.extend(breakdown_lines)
-
-    lines.append(f"\n🕒 {_format_listing_age(listing.get('posted_at'))}")
-    lines.append(f"📍 {listing.get('location')}")
+    lines = [
+        f"📱 <b>{n.get('model') or listing.get('title', '?')}</b>\n",
+        f"⏳ <b>Publié</b>\n{_format_listing_age(listing.get('posted_at'))}\n",
+        f"🏷️ <b>Marque</b>\nApple\n",
+        f"💎 <b>État</b>\n{condition_label}\n",
+        f"💰 <b>Prix</b>\n{price} €" if price is not None else "💰 <b>Prix</b>\nnon précisé",
+    ]
     return "\n".join(lines)
 
 
@@ -720,7 +665,7 @@ def _listing_keyboard(listing_id: str, url: str) -> InlineKeyboardMarkup:
 
 
 # ---------------------------------------------------------
-# CYCLE DE SCAN
+# CYCLE DE SCAN — envoie toutes les annonces whole_phone, sans score
 # ---------------------------------------------------------
 
 async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = False, reply_message=None) -> dict:
@@ -730,8 +675,6 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
         return {}
 
     async with SCAN_LOCK:
-        threshold = context.bot_data.get("score_threshold", DEFAULT_SCORE_THRESHOLD)
-
         counters = {
             "found_raw": 0, "accepted_source": 0,
             "rejected_accessory": 0, "rejected_parts": 0, "rejected_service": 0,
@@ -780,7 +723,6 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                         continue
 
                     listing = estimate_listing(listing)
-                    listing = score_listing(listing)
 
                     listing_id = insert_listing(listing)
                     if listing_id is None:
@@ -790,13 +732,25 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                     if listing.get("relevance", {}).get("listing_type") != "whole_phone":
                         continue
 
-                    if listing.get("score", 0) >= threshold and ALLOWED_CHAT_ID:
-                        await context.bot.send_message(
-                            chat_id=ALLOWED_CHAT_ID,
-                            text=_format_deal_message(listing),
-                            parse_mode=ParseMode.HTML,
-                            reply_markup=_listing_keyboard(str(listing_id), listing["url"]),
-                        )
+                    if ALLOWED_CHAT_ID:
+                        photos = listing.get("photos") or []
+                        caption = _format_deal_message(listing)
+                        keyboard = _listing_keyboard(str(listing_id), listing["url"])
+                        if photos:
+                            await context.bot.send_photo(
+                                chat_id=ALLOWED_CHAT_ID,
+                                photo=photos[0],
+                                caption=caption,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=keyboard,
+                            )
+                        else:
+                            await context.bot.send_message(
+                                chat_id=ALLOWED_CHAT_ID,
+                                text=caption,
+                                parse_mode=ParseMode.HTML,
+                                reply_markup=keyboard,
+                            )
                         counters["sent"] += 1
 
                 except Exception:
@@ -856,7 +810,6 @@ async def post_init(application: Application) -> None:
         ("reglages", "Afficher les réglages"),
         ("setmarge", "Modifier la marge minimale"),
         ("setroi", "Modifier le ROI minimum"),
-        ("setscore", "Modifier le seuil de score du scan auto"),
         ("aide", "Afficher le guide"),
     ])
     LOGGER.info("Commandes Telegram configurées.")
@@ -885,7 +838,6 @@ def main() -> None:
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("setmarge", set_margin))
     application.add_handler(CommandHandler("setroi", set_roi))
-    application.add_handler(CommandHandler("setscore", set_score))
     application.add_handler(CommandHandler("aide", help_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_handler))
@@ -894,7 +846,7 @@ def main() -> None:
 
     application.job_queue.run_repeating(scan_job, interval=CYCLE_SECONDS, first=15)
 
-    LOGGER.info("Bot Vinted démarré. Scan auto toutes les %ds.", CYCLE_SECONDS)
+    LOGGER.info("Bot Vinted démarré (sans filtre de score). Scan auto toutes les %ds.", CYCLE_SECONDS)
 
     application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
