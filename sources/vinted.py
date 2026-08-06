@@ -174,14 +174,16 @@ class VintedSource:
             return None
 
         photo_obj = getattr(item, "photo", None)
-photo = None
-if photo_obj is not None:
-    photo = getattr(photo_obj, "url", None) or getattr(photo_obj, "full_size_url", None)
-    if photo is None and isinstance(photo_obj, dict):
-        photo = photo_obj.get("url") or photo_obj.get("full_size_url")
-    if photo is None and isinstance(photo_obj, str):
-        photo = photo_obj
+        photo = None
 
+        if photo_obj is not None:
+            photo = getattr(photo_obj, "url", None)
+
+            if photo is None and isinstance(photo_obj, dict):
+                photo = photo_obj.get("url")
+
+            if photo is None and isinstance(photo_obj, str):
+                photo = photo_obj
 
         # État réel Vinted (texte du vendeur, ex: "Très bon état") — distinct
         # de notre propre classification interne faite sur le titre dans
@@ -230,4 +232,3 @@ if __name__ == "__main__":
     for r in results[:5]:
         print(r)
     print("Stats:", get_last_stats())
- 
