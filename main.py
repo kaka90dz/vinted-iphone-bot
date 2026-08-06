@@ -59,10 +59,6 @@ DEFAULT_SETTINGS: Final[dict[str, Decimal]] = {
 MONEY_STEP: Final[Decimal] = Decimal("0.01")
 PERCENT_STEP: Final[Decimal] = Decimal("0.1")
 
-# Vinted n'offre pas de webhook temps réel pour un scraper non-authentifié :
-# un scan très rapproché (60s) est l'équivalent le plus proche d'une
-# notification instantanée dès qu'une annonce est mise en ligne, sans
-# dépendre d'un service payant (voir échange du 5 août sur les alternatives).
 CYCLE_SECONDS: Final[int] = int(os.getenv("CYCLE_SECONDS", "60"))
 SOURCES = [fetch_vinted]
 SOURCE_STATS_GETTERS = {fetch_vinted: get_vinted_stats}
@@ -224,7 +220,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         "<b>Menu :</b> /menu\n\n"
         "🔎 Le scan automatique Vinted tourne en tâche de fond (toutes les "
         f"{CYCLE_SECONDS}s) et envoie toutes les annonces de téléphones "
-        "complets — jamais d'étuis, pièces, kits ou services."
+        "complets — jamais d'étuis ni d'accessoires."
     )
     await update.effective_message.reply_text(text, parse_mode=ParseMode.HTML)
 
@@ -556,18 +552,15 @@ async def send_bot_state(message, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def send_filters_summary(message) -> None:
-    from pipeline.relevance import (
-        BUYER_PATTERNS, SERVICE_PATTERNS, ACCESSORY_PATTERNS,
-        PARTS_PATTERNS, CATALOG_PATTERNS, OTHER_BRAND_PATTERNS,
-    )
+    from pipeline.relevance import BUYER_PATTERNS, ACCESSORY_PATTERNS, OTHER_BRAND_PATTERNS
+
     await message.reply_text(
         "🧰 <b>Filtres actifs</b>\n\n"
-        f"Acheteurs : {len(BUYER_PATTERNS)} règles\n"
-        f"Services/réparateurs : {len(SERVICE_PATTERNS)} règles\n"
+        f"Acheteurs pro : {len(BUYER_PATTERNS)} règles\n"
         f"Accessoires : {len(ACCESSORY_PATTERNS)} règles\n"
-        f"Pièces/kits : {len(PARTS_PATTERNS)} règles\n"
-        f"Catalogues : {len(CATALOG_PATTERNS)} règles\n"
         f"Autres marques : {len(OTHER_BRAND_PATTERNS)} règles\n\n"
+        "🚫 Désactivés (spécifique Vinted) : pièces détachées, "
+        "services/réparateurs, catalogues de vendeurs pro\n\n"
         f"Catégorie de recherche active : {get_current_category_label()}\n"
         "Seuls les téléphones complets (whole_phone) sont envoyés — aucun filtre de score.",
         parse_mode=ParseMode.HTML,
@@ -641,9 +634,6 @@ def _format_listing_age(posted_at_iso: str | None) -> str:
     return f"il y a {hours / 24:.1f} j"
 
 
-# Repli utilisé UNIQUEMENT si Vinted n'a pas fourni de texte d'état
-# (vinted_status vide) — dans ce cas on retombe sur notre propre
-# classification interne, faite à partir du titre de l'annonce.
 _CONDITION_LABELS = {
     "icloud_locked": "iCloud verrouillé",
     "water_damage": "Dégâts d'eau",
@@ -663,8 +653,6 @@ def _format_deal_message(listing: dict) -> str:
     e = listing.get("estimation", {})
     price = e.get("listing_price_eur")
 
-    # Priorité au texte d'état RÉEL fourni par Vinted (ex: "Très bon état").
-    # Si absent, on retombe sur notre classification interne (titre analysé).
     vinted_status = listing.get("vinted_status")
     condition_label = vinted_status or _CONDITION_LABELS.get(
         n.get("condition", "unknown"), "État non précisé"
@@ -808,9 +796,8 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                     f"Trouvées : {counters['found_raw']} · Envoyées : {counters['sent']} · "
                     f"Doublons : {counters['duplicates']}\n"
                     f"Rejetées — accessoires : {counters['rejected_accessory']}, "
-                    f"pièces : {counters['rejected_parts']}, services : {counters['rejected_service']}, "
                     f"acheteurs : {counters['rejected_buyer']}, autres marques : {counters['rejected_other_brand']}, "
-                    f"catalogues : {counters['rejected_catalog']}, ambiguës : {counters['rejected_ambiguous']}\n"
+                    f"ambiguës : {counters['rejected_ambiguous']}\n"
                     f"Trop vieilles : {counters['rejected_too_old']} · Trop loin : {counters['rejected_too_far']}"
                 ),
                 parse_mode=ParseMode.HTML,
