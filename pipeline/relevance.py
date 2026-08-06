@@ -1,28 +1,26 @@
 """
 pipeline/relevance.py
 
-Source UNIQUE de vérité pour décider si une annonce vend réellement un
-iPhone complet (fonctionnel, écran cassé, batterie à changer, ne s'allume
-plus, pour pièces, tel quel) — par opposition à un accessoire, une pièce
-détachée, un service de réparation, une annonce d'acheteur, un catalogue
-multi-modèles, ou une autre marque.
+Source de vérité pour décider si une annonce vend réellement un iPhone
+complet — par opposition à un accessoire, une annonce d'acheteur pro,
+une autre marque, ou une annonce ambiguë (aucune mention iPhone).
 
-Identique à la version iphone-deals-bot — les règles sont déjà en
-français/anglais et ne dépendent pas de la source (Facebook ou Vinted).
+Version bot Vinted : les catégories "pièce détachée" (part_only),
+"service/réparateur" (repair_service) et "catalogue de vendeur pro"
+(shop_catalog) sont volontairement DÉSACTIVÉES — ces situations
+n'existent quasiment pas sur Vinted (contrairement à Facebook
+Marketplace où des ateliers de réparation et revendeurs pro postent
+des annonces). Les listes de mots-clés PARTS_PATTERNS, SERVICE_PATTERNS
+et CATALOG_PATTERNS restent définies ci-dessous pour référence/débogage,
+mais ne sont plus utilisées dans classify_listing().
 
-Principe central : les règles de REJET sont évaluées AVANT toute
-détection de modèle. "Étui iPhone 11" contient un modèle, mais "étui"
-doit gagner.
-
-Ordre d'évaluation (fixe, ne pas réordonner sans mettre à jour les tests) :
+Ordre d'évaluation actif (fixe, ne pas réordonner sans mettre à jour
+les tests) :
     1. acheteur professionnel      -> buyer_ad
-    2. réparateur ou service       -> repair_service
-    3. accessoire                  -> accessory
-    4. pièce seule / kit           -> part_only
-    5. catalogue / plusieurs modèles -> shop_catalog
-    6. autre marque                -> other_brand
-    7. aucune mention "iPhone"     -> ambiguous
-    8. sinon                       -> whole_phone
+    2. accessoire                  -> accessory
+    3. autre marque                -> other_brand
+    4. aucune mention "iPhone"     -> ambiguous
+    5. sinon                       -> whole_phone
 """
 
 from __future__ import annotations
@@ -32,12 +30,6 @@ import unicodedata
 from dataclasses import dataclass, asdict
 from typing import Optional
 
-
-# ---------------------------------------------------------------------
-# Normalisation de texte : minuscules, accents retirés, guillemets
-# courbes uniformisés. Toutes les listes de mots-clés ci-dessous sont
-# déjà écrites en version "normalisée" (sans accents).
-# ---------------------------------------------------------------------
 
 def _normalize(text: Optional[str]) -> str:
     if not text:
@@ -49,16 +41,13 @@ def _normalize(text: Optional[str]) -> str:
 
 
 def _compile(patterns: list[str]) -> re.Pattern:
-    """Compile une liste de mots-clés/phrases en un seul pattern avec
-    frontières de mot, pour éviter les faux positifs sur des sous-chaînes
-    (ex: 'changer' ne doit pas matcher 'charger')."""
     escaped = sorted((re.escape(p) for p in patterns), key=len, reverse=True)
     return re.compile(r"\b(?:" + "|".join(escaped) + r")\b")
 
 
 # ---------------------------------------------------------------------
-# VOCABULAIRE — une entrée par catégorie de rejet, dans l'ordre du brief.
-# Toutes les chaînes sont déjà sans accents (comparées à du texte normalisé).
+# VOCABULAIRE — patterns actifs + patterns conservés pour référence
+# (part_only / repair_service / shop_catalog ne sont plus appliqués)
 # ---------------------------------------------------------------------
 
 BUYER_PATTERNS = [
@@ -110,8 +99,6 @@ OTHER_BRAND_PATTERNS = [
     "motorola", "xiaomi", "nokia", "lg",
 ]
 
-# Preuves positives : ne servent qu'à augmenter la confiance, jamais à
-# rejeter. Une annonce peut être acceptée sans aucune de ces preuves.
 POSITIVE_PATTERNS = [
     "a vendre", "for sale", "telephone", "phone", "cellulaire",
     "appareil", "device", "fonctionne", "fully functional",
@@ -124,22 +111,20 @@ POSITIVE_PATTERNS = [
 MODEL_MENTION_RE = re.compile(r"\b(?:apple\s+)?iphone\b")
 
 _BUYER_RE = _compile(BUYER_PATTERNS)
-_SERVICE_RE = _compile(SERVICE_PATTERNS)
 _ACCESSORY_RE = _compile(ACCESSORY_PATTERNS)
-_PARTS_RE = _compile(PARTS_PATTERNS)
-_CATALOG_RE = _compile(CATALOG_PATTERNS)
 _OTHER_BRAND_RE = _compile(OTHER_BRAND_PATTERNS)
 _POSITIVE_RE = _compile(POSITIVE_PATTERNS)
+# _SERVICE_RE, _PARTS_RE, _CATALOG_RE ne sont plus compilés/utilisés —
+# ces filtres sont désactivés sur le bot Vinted (voir docstring).
 
 
 @dataclass
 class ClassificationResult:
     is_relevant: bool
-    listing_type: str  # whole_phone | accessory | part_only | repair_service
-                        # | buyer_ad | shop_catalog | other_brand | ambiguous
+    listing_type: str
     rejection_reason: Optional[str]
     matched_rule: str
-    confidence: str  # "high" | "medium" | "low"
+    confidence: str
 
     def as_dict(self) -> dict:
         return asdict(self)
@@ -150,8 +135,9 @@ def _slug(match_text: str) -> str:
 
 
 def classify_listing(title: str, description: str = "") -> ClassificationResult:
-    """Classifie une annonce. Évalue les règles de rejet dans l'ordre
-    fixe du brief, avant toute tentative de détection de modèle."""
+    """Classifie une annonce. part_only / repair_service / shop_catalog
+    sont désactivés (voir docstring du module) — seuls buyer_ad,
+    accessory, other_brand et ambiguous peuvent rejeter une annonce."""
     text = _normalize(f"{title} {description}")
 
     m = _BUYER_RE.search(text)
@@ -161,16 +147,6 @@ def classify_listing(title: str, description: str = "") -> ClassificationResult:
             listing_type="buyer_ad",
             rejection_reason="buyer_ad",
             matched_rule=f"BUYER_{_slug(m.group(0))}",
-            confidence="high",
-        )
-
-    m = _SERVICE_RE.search(text)
-    if m:
-        return ClassificationResult(
-            is_relevant=False,
-            listing_type="repair_service",
-            rejection_reason="repair_service",
-            matched_rule=f"SERVICE_{_slug(m.group(0))}",
             confidence="high",
         )
 
@@ -184,26 +160,6 @@ def classify_listing(title: str, description: str = "") -> ClassificationResult:
                 "wallet case", "flip case", "cover", "bumper", "quad lock",
             ) else "accessory",
             matched_rule=f"ACCESSORY_{_slug(m.group(0))}",
-            confidence="high",
-        )
-
-    m = _PARTS_RE.search(text)
-    if m:
-        return ClassificationResult(
-            is_relevant=False,
-            listing_type="part_only",
-            rejection_reason="part_repair_kit" if "kit" in m.group(0) or "tool" in m.group(0) else "part_only",
-            matched_rule=f"PART_{_slug(m.group(0))}",
-            confidence="high",
-        )
-
-    m = _CATALOG_RE.search(text)
-    if m:
-        return ClassificationResult(
-            is_relevant=False,
-            listing_type="shop_catalog",
-            rejection_reason="shop_catalog",
-            matched_rule=f"CATALOG_{_slug(m.group(0))}",
             confidence="high",
         )
 
