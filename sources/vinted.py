@@ -1,234 +1,113 @@
 """
-sources/vinted.py
+pipeline/vinted_buy.py
 
-Récupère les annonces Vinted (France) via la lib `vinted-scraper`.
+Tentative d'achat sur Vinted via l'API interne, en utilisant le token de
+session OAuth du compte utilisateur (récupéré manuellement dans les
+outils développeur du navigateur — voir /aide sur le bot).
 
-Deux catégories de recherche, sélectionnables depuis le menu Telegram
-(voir main.py) :
-    - "broken" (défaut) : iPhone cassés, bloqués iCloud, pour pièces
-    - "all"             : tous les iPhone, sans restriction d'état
+IMPORTANT — honnêteté technique :
+Vinted ne documente aucune API d'achat publique. L'endpoint et le format
+exact du payload de checkout ci-dessous sont une meilleure estimation
+basée sur la structure REST habituelle de Vinted, mais n'ont PAS été
+vérifiés par un achat réel réussi. Il est très possible que ça échoue
+au premier essai — dans ce cas, le bot bascule automatiquement sur un
+bouton "🛒 Acheter maintenant" manuel en secours (voir main.py), donc
+aucune affaire n'est jamais ratée silencieusement.
 
-La catégorie active est un état en mémoire du process (set_category),
-lue à chaque appel de fetch() — donc un changement de catégorie
-s'applique aussi bien au prochain scan manuel qu'au prochain scan
-automatique planifié, sans redémarrage du bot.
+Pour fiabiliser l'endpoint toi-même :
+  1. Connecte-toi sur vinted.fr dans Chrome/Firefox
+  2. Ouvre les outils développeur > onglet Réseau, coche "Persist logs"
+  3. Fais un achat normal (petit montant, test) et clique "Acheter"
+  4. Repère la requête POST qui déclenche réellement le paiement
+     (cherche un nom du type "checkout", "transactions", "orders")
+  5. Note son URL exacte, ses headers, et le corps JSON envoyé
+  6. Remplace BUY_ENDPOINT et _build_payload() ci-dessous avec ces valeurs
+     exactes (demande-moi de l'aide pour adapter le code une fois que tu
+     as ces infos, ce sera rapide)
 
-Champs supplémentaires extraits par rapport aux versions précédentes :
-    - status : le texte d'état RÉEL fourni par Vinted (ex: "Très bon état"),
-      distinct de notre propre classification interne (cracked_screen,
-      battery_issue, etc.) faite dans pipeline/normalize.py à partir du titre.
-    - size_title : utilisé ici comme indicateur de stockage/variante si
-      renseigné par le vendeur (rarement rempli pour des téléphones,
-      Vinted étant avant tout un site de vêtements — peut être vide).
-    - seller_login : pseudo du vendeur, pour affichage uniquement.
-
-Tous ces champs sont lus avec getattr(..., None) : s'ils n'existent pas
-sur l'objet retourné par la lib (selon la version, ou si Vinted ne les a
-pas fournis pour cette annonce), on obtient None sans planter.
+Pour récupérer ton token (à donner ensuite au bot via /settoken) :
+  1. Connecte-toi sur vinted.fr
+  2. Outils développeur > Réseau > coche "Persist logs"
+  3. Recharge la page, tape "oauth" dans la barre de recherche du panneau
+  4. Clique sur la requête "oauth" trouvée, va dans l'onglet Réponse
+  5. Copie la valeur "access_token"
 """
 
-import os
+import re
 import logging
-from datetime import datetime, timezone
 from typing import Optional
 
-from vinted_scraper import VintedScraper
+import httpx
 
 logger = logging.getLogger(__name__)
 
-VINTED_BASE_URL = os.environ.get("VINTED_BASE_URL", "https://www.vinted.fr")
-VINTED_PRICE_MAX = os.environ.get("VINTED_PRICE_MAX")  # optionnel, en EUR
-VINTED_RESULTS_PER_SEARCH = int(os.environ.get("VINTED_RESULTS_PER_SEARCH", "20"))
+VINTED_API_BASE = "https://www.vinted.fr"
 
-BROKEN_SEARCHES = [
-    {"query": "iphone cassé"},
-    {"query": "iphone écran fissuré"},
-    {"query": "iphone hs"},
-    {"query": "iphone pour pièces"},
-    {"query": "iphone ne s'allume plus"},
-    {"query": "iphone icloud"},
-]
+# À AJUSTER une fois l'endpoint réel capturé — voir docstring ci-dessus.
+# Ceci est une estimation non vérifiée.
+BUY_ENDPOINT = "/api/v2/transactions/init"
 
-ALL_SEARCHES = [
-    {"query": "iphone 11"},
-    {"query": "iphone 12"},
-    {"query": "iphone 13"},
-    {"query": "iphone 14"},
-    {"query": "iphone 15"},
-    {"query": "iphone 16"},
-    {"query": "iphone se"},
-    {"query": "iphone xr"},
-    {"query": "iphone xs"},
-]
-
-CATEGORIES = {
-    "broken": BROKEN_SEARCHES,
-    "all": ALL_SEARCHES,
-}
-
-CATEGORY_LABELS = {
-    "broken": "iPhone cassé / bloqué / pour pièces",
-    "all": "Tous les iPhone",
-}
-
-_current_category = "broken"
+_ITEM_ID_RE = re.compile(r"/items/(\d+)")
 
 
-def set_category(category: str) -> None:
-    global _current_category
-    if category not in CATEGORIES:
-        raise ValueError(f"Catégorie inconnue: {category}")
-    _current_category = category
+class AutobuyError(Exception):
+    """Levée quand la tentative d'achat automatique échoue.
+    L'appelant doit alors proposer le bouton d'achat manuel en secours."""
 
 
-def get_current_category() -> str:
-    return _current_category
+def extract_item_id(url: str) -> Optional[str]:
+    """Extrait l'ID numérique Vinted d'une URL d'annonce, ex:
+    https://www.vinted.fr/items/1234567890-mon-iphone -> '1234567890'"""
+    match = _ITEM_ID_RE.search(url)
+    return match.group(1) if match else None
 
 
-def get_current_category_label() -> str:
-    return CATEGORY_LABELS.get(_current_category, _current_category)
+def _build_headers(token: str, csrf_token: Optional[str] = None) -> dict:
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+        "User-Agent": (
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 18_0 like Mac OS X) "
+            "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/18.0 Mobile/15E148 Safari/604.1"
+        ),
+    }
+    if csrf_token:
+        headers["X-CSRF-Token"] = csrf_token
+    return headers
 
 
-class ScanStats:
-    def __init__(self):
-        self.found_raw = 0
-        self.accepted_source = 0
-        self.rejected_too_old = 0
-        self.rejected_too_far = 0
-        self.errors = 0
-
-    def as_dict(self) -> dict:
-        return {
-            "found_raw": self.found_raw,
-            "accepted_source": self.accepted_source,
-            "rejected_too_old": self.rejected_too_old,
-            "rejected_too_far": self.rejected_too_far,
-            "errors": self.errors,
-        }
+def _build_payload(item_id: str) -> dict:
+    # À AJUSTER selon la capture réseau réelle (voir docstring du module).
+    return {"item_id": item_id}
 
 
-_last_stats = ScanStats()
+async def attempt_purchase(token: str, item_id: str, csrf_token: Optional[str] = None) -> dict:
+    """Tente un achat automatique sur Vinted.
 
+    Lève AutobuyError en cas d'échec (mauvais token, endpoint incorrect,
+    item déjà vendu, etc.) — l'appelant doit alors proposer le bouton
+    d'achat manuel en secours plutôt que de considérer l'annonce perdue.
+    """
+    headers = _build_headers(token, csrf_token)
+    payload = _build_payload(item_id)
+    url = f"{VINTED_API_BASE}{BUY_ENDPOINT}"
 
-def get_last_stats() -> dict:
-    return _last_stats.as_dict()
+    logger.info("Tentative d'achat automatique pour l'item %s", item_id)
 
+    async with httpx.AsyncClient(timeout=10) as client:
+        try:
+            response = await client.post(url, json=payload, headers=headers)
+        except httpx.HTTPError as exc:
+            raise AutobuyError(f"Erreur réseau: {exc}") from exc
 
-class VintedSource:
-    name = "vinted"
+    if response.status_code >= 400:
+        raise AutobuyError(
+            f"Vinted a refusé la requête d'achat (HTTP {response.status_code}): "
+            f"{response.text[:300]}"
+        )
 
-    def __init__(self, searches: Optional[list] = None):
-        self.scraper = VintedScraper(VINTED_BASE_URL)
-        self.searches = searches or CATEGORIES[_current_category]
-
-    def _build_params(self, search: dict) -> dict:
-        params = {
-            "search_text": search["query"],
-            "order": "newest_first",
-            "currency": "EUR",
-        }
-        price_max = search.get("price_max") or VINTED_PRICE_MAX
-        if price_max:
-            params["price_to"] = price_max
-        return params
-
-    def fetch(self) -> list[dict]:
-        global _last_stats
-        stats = ScanStats()
-        all_listings: list[dict] = []
-
-        for search in self.searches:
-            params = self._build_params(search)
-            logger.info("Recherche Vinted [%s]: %s", _current_category, params)
-
-            try:
-                items = self.scraper.search(params)
-            except Exception:
-                logger.exception("Échec de la recherche Vinted pour %s", search)
-                stats.errors += 1
-                continue
-
-            for item in items[:VINTED_RESULTS_PER_SEARCH]:
-                stats.found_raw += 1
-                try:
-                    listing = self._format(item, search)
-                except Exception:
-                    logger.exception(
-                        "Échec traitement d'une annonce Vinted (recherche %s)",
-                        search.get("query", "?"),
-                    )
-                    stats.errors += 1
-                    continue
-                if listing:
-                    stats.accepted_source += 1
-                    all_listings.append(listing)
-
-        _last_stats = stats
-        logger.info("Scan source Vinted terminé [%s]: %s", _current_category, stats.as_dict())
-        return all_listings
-
-    def _format(self, item, search: dict) -> Optional[dict]:
-        title = getattr(item, "title", None)
-        url = getattr(item, "url", None)
-        if not title or not url:
-            return None
-
-        photo_obj = getattr(item, "photo", None)
-        photo = None
-
-        if photo_obj is not None:
-            photo = getattr(photo_obj, "url", None)
-
-            if photo is None and isinstance(photo_obj, dict):
-                photo = photo_obj.get("url")
-
-            if photo is None and isinstance(photo_obj, str):
-                photo = photo_obj
-
-        # État réel Vinted (texte du vendeur, ex: "Très bon état") — distinct
-        # de notre propre classification interne faite sur le titre dans
-        # pipeline/normalize.py. Peut être None selon les versions de la lib.
-        vinted_status = getattr(item, "status", None)
-
-        # Rarement rempli pour des téléphones (Vinted = vêtements avant
-        # tout), mais on le récupère si présent.
-        size_title = getattr(item, "size_title", None)
-
-        # Pseudo vendeur, pour affichage uniquement (peut être un objet
-        # imbriqué selon la version de la lib -> on tente .login sinon None).
-        seller_login = None
-        user_obj = getattr(item, "user", None)
-        if user_obj is not None:
-            seller_login = getattr(user_obj, "login", None)
-            if seller_login is None and isinstance(user_obj, dict):
-                seller_login = user_obj.get("login")
-
-        return {
-            "source": self.name,
-            "source_search_query": search.get("query", ""),
-            "title": title,
-            "description": "",
-            "price_raw": getattr(item, "price", None),
-            "currency": "EUR",
-            "location": "FR",
-            "url": url,
-            "photos": [photo] if photo else [],
-            "posted_at": None,
-            "fetched_at": datetime.now(timezone.utc).isoformat(),
-            "vinted_status": vinted_status,
-            "vinted_size": size_title,
-            "seller_login": seller_login,
-        }
-
-
-def fetch() -> list[dict]:
-    source = VintedSource()
-    return source.fetch()
-
-
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    results = fetch()
-    for r in results[:5]:
-        print(r)
-    print("Stats:", get_last_stats())
+    try:
+        return response.json()
+    except ValueError:
+        return {"raw": response.text[:300]}
