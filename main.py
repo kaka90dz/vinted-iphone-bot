@@ -30,6 +30,7 @@ from sources.vinted import (
 from pipeline.normalize import normalize_listing, USE_ANTHROPIC_NORMALIZER
 import pipeline.normalize as normalize_module
 from pipeline.estimate import estimate_listing
+from pipeline.vinted_buy import attempt_purchase, AutobuyError, extract_item_id
 from storage.db import insert_listing, get_recent_sent, get_connection
 
 
@@ -454,6 +455,41 @@ async def set_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.effective_message.reply_text(f"✅ ROI minimum réglé à {percent(value)}.")
 
 
+async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text(
+            "Utilisation : <code>/settoken TON_TOKEN</code>\n\n"
+            "⚠️ Ton message sera supprimé automatiquement après (le token "
+            "ne doit pas rester visible dans l'historique du chat).",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    token = context.args[0]
+    context.user_data["vinted_token"] = token
+    try:
+        await update.effective_message.delete()
+    except Exception:
+        pass
+    await context.bot.send_message(
+        chat_id=update.effective_chat.id,
+        text="✅ Token enregistré. Si ton message précédent contenant le "
+             "token est toujours visible, supprime-le manuellement par sécurité.",
+    )
+
+
+async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    token = context.user_data.get("vinted_token")
+    if not token:
+        await update.effective_message.reply_text("❌ Aucun token enregistré. Utilise /settoken.")
+        return
+    masked = token[:6] + "…" + token[-4:] if len(token) > 12 else "•••"
+    await update.effective_message.reply_text(f"🔑 Token enregistré : <code>{masked}</code>", parse_mode=ParseMode.HTML)
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
@@ -464,6 +500,8 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Enchère maximale</b>\n<code>/enchere revente réparation livraison autres frais% risque%</code>\n\n"
         "<b>Comparer</b>\n<code>/compare achat1 revente1 achat2 revente2 frais% risque%</code>\n\n"
         "<b>Réglages</b>\n<code>/reglages</code> · <code>/setmarge 40</code> · <code>/setroi 25</code>\n\n"
+        "<b>Achat</b>\n<code>/settoken TON_TOKEN</code> une seule fois, puis appuie sur "
+        "\"🛒 Acheter maintenant\" sur les annonces qui t'intéressent\n\n"
         "<b>Scan</b>\n<code>/scan</code> lance un scan manuel immédiat\n\n"
         "<b>Menu :</b> /menu",
         parse_mode=ParseMode.HTML,
@@ -509,6 +547,23 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             parse_mode=ParseMode.HTML,
         )
         await run_scan_cycle(context, manual=True, reply_message=query.message)
+    elif query.data.startswith("buy:"):
+        item_id = query.data.split(":", 1)[1]
+        token = context.user_data.get("vinted_token")
+        if not token:
+            await query.message.reply_text("❌ Aucun token Vinted enregistré. Utilise /settoken.")
+            return
+        await query.message.reply_text("🛒 Tentative d'achat en cours...")
+        try:
+            result = await attempt_purchase(token, item_id)
+            await query.message.reply_text(f"✅ Achat réussi !\n<code>{result}</code>", parse_mode=ParseMode.HTML)
+        except AutobuyError as exc:
+            await query.message.reply_text(
+                f"❌ L'achat automatique a échoué : {exc}\n\n"
+                "L'endpoint n'est pas encore calibré pour ton compte (voir "
+                "les instructions dans pipeline/vinted_buy.py) — achète "
+                "manuellement via le lien de l'annonce en attendant."
+            )
     elif query.data.startswith("fb:"):
         await handle_listing_feedback(query, context)
 
@@ -677,19 +732,21 @@ def _format_deal_message(listing: dict) -> str:
     return "\n".join(lines)
 
 
-def _listing_keyboard(listing_id: str, url: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔗 Ouvrir l'annonce", url=url)],
-        [
-            InlineKeyboardButton("👍 Intéressant", callback_data=f"fb:{listing_id}:interesting"),
-            InlineKeyboardButton("👎 Pas intéressant", callback_data=f"fb:{listing_id}:not_interesting"),
-            InlineKeyboardButton("🚫 Mauvaise annonce", callback_data=f"fb:{listing_id}:bad_listing"),
-        ],
+def _listing_keyboard(listing_id: str, url: str, vinted_item_id: str | None) -> InlineKeyboardMarkup:
+    rows = [[InlineKeyboardButton("🔗 Ouvrir l'annonce", url=url)]]
+    if vinted_item_id:
+        rows.append([InlineKeyboardButton("🛒 Acheter maintenant", callback_data=f"buy:{vinted_item_id}")])
+    rows.append([
+        InlineKeyboardButton("👍 Intéressant", callback_data=f"fb:{listing_id}:interesting"),
+        InlineKeyboardButton("👎 Pas intéressant", callback_data=f"fb:{listing_id}:not_interesting"),
+        InlineKeyboardButton("🚫 Mauvaise annonce", callback_data=f"fb:{listing_id}:bad_listing"),
     ])
+    return InlineKeyboardMarkup(rows)
 
 
 # ---------------------------------------------------------
-# CYCLE DE SCAN — envoie toutes les annonces whole_phone, sans score
+# CYCLE DE SCAN — envoie toutes les annonces whole_phone, sans score,
+# avec un bouton d'achat manuel par annonce (aucun achat automatique)
 # ---------------------------------------------------------
 
 async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = False, reply_message=None) -> dict:
@@ -759,7 +816,9 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                     if ALLOWED_CHAT_ID:
                         photos = listing.get("photos") or []
                         caption = _format_deal_message(listing)
-                        keyboard = _listing_keyboard(str(listing_id), listing["url"])
+                        vinted_item_id = extract_item_id(listing["url"])
+                        keyboard = _listing_keyboard(str(listing_id), listing["url"], vinted_item_id)
+
                         if photos:
                             await context.bot.send_photo(
                                 chat_id=ALLOWED_CHAT_ID,
@@ -833,6 +892,8 @@ async def post_init(application: Application) -> None:
         ("reglages", "Afficher les réglages"),
         ("setmarge", "Modifier la marge minimale"),
         ("setroi", "Modifier le ROI minimum"),
+        ("settoken", "Enregistrer ton token Vinted (pour acheter)"),
+        ("tokenstatus", "Voir si un token est enregistré"),
         ("aide", "Afficher le guide"),
     ])
     LOGGER.info("Commandes Telegram configurées.")
@@ -861,6 +922,8 @@ def main() -> None:
     application.add_handler(CommandHandler("settings", settings_command))
     application.add_handler(CommandHandler("setmarge", set_margin))
     application.add_handler(CommandHandler("setroi", set_roi))
+    application.add_handler(CommandHandler("settoken", set_token))
+    application.add_handler(CommandHandler("tokenstatus", token_status))
     application.add_handler(CommandHandler("aide", help_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_handler))
