@@ -8,10 +8,12 @@ Deux catégories de recherche, sélectionnables depuis le menu Telegram
     - "broken" (défaut) : iPhone cassés, bloqués iCloud, pour pièces
     - "all"             : tous les iPhone, sans restriction d'état
 
-La catégorie active est un état en mémoire du process (set_category),
-lue à chaque appel de fetch() — donc un changement de catégorie
-s'applique aussi bien au prochain scan manuel qu'au prochain scan
-automatique planifié, sans redémarrage du bot.
+CORRECTIF IMPORTANT : item.photo n'est pas toujours une simple chaîne
+d'URL — selon la version de la lib, c'est un objet structuré avec ses
+propres attributs (url, full_size_url, etc.). Envoyer cet objet tel
+quel à Telegram produit l'erreur "wrong port number specified in the
+url" car Telegram reçoit une représentation texte de l'objet Python
+au lieu d'une vraie URL. _extract_photo_url() gère les deux cas.
 """
 
 import os
@@ -101,6 +103,27 @@ def get_last_stats() -> dict:
     return _last_stats.as_dict()
 
 
+def _extract_photo_url(photo_obj) -> Optional[str]:
+    """Extrait une vraie URL texte depuis le champ photo, quel que soit
+    son type réel (chaîne directe, objet avec attributs, ou dict)."""
+    if photo_obj is None:
+        return None
+    if isinstance(photo_obj, str):
+        return photo_obj if photo_obj.startswith("http") else None
+    if isinstance(photo_obj, dict):
+        for key in ("url", "full_size_url", "thumbnail_url", "dominant_color_full_size_url"):
+            value = photo_obj.get(key)
+            if isinstance(value, str) and value.startswith("http"):
+                return value
+        return None
+    # Objet avec attributs (cas le plus courant selon la version de la lib)
+    for attr in ("url", "full_size_url", "thumbnail_url"):
+        value = getattr(photo_obj, attr, None)
+        if isinstance(value, str) and value.startswith("http"):
+            return value
+    return None
+
+
 class VintedSource:
     name = "vinted"
 
@@ -160,7 +183,7 @@ class VintedSource:
         if not title or not url:
             return None
 
-        photo = getattr(item, "photo", None)
+        photo_url = _extract_photo_url(getattr(item, "photo", None))
 
         vinted_status = getattr(item, "status", None)
         size_title = getattr(item, "size_title", None)
@@ -181,7 +204,7 @@ class VintedSource:
             "currency": "EUR",
             "location": "FR",
             "url": url,
-            "photos": [photo] if photo else [],
+            "photos": [photo_url] if photo_url else [],
             "posted_at": None,
             "fetched_at": datetime.now(timezone.utc).isoformat(),
             "vinted_status": vinted_status,
