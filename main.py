@@ -744,6 +744,39 @@ def _listing_keyboard(listing_id: str, url: str, vinted_item_id: str | None) -> 
     return InlineKeyboardMarkup(rows)
 
 
+async def _send_listing_notification(context: ContextTypes.DEFAULT_TYPE, listing: dict, listing_id) -> None:
+    """Envoie la notification pour une annonce. Si l'envoi avec photo
+    échoue pour n'importe quelle raison, bascule automatiquement sur un
+    envoi en texte simple — l'annonce n'est jamais perdue silencieusement
+    juste parce qu'une URL de photo est mal formée."""
+    photos = listing.get("photos") or []
+    caption = _format_deal_message(listing)
+    vinted_item_id = extract_item_id(listing["url"])
+    keyboard = _listing_keyboard(str(listing_id), listing["url"], vinted_item_id)
+
+    if photos:
+        try:
+            await context.bot.send_photo(
+                chat_id=ALLOWED_CHAT_ID,
+                photo=photos[0],
+                caption=caption,
+                parse_mode=ParseMode.HTML,
+                reply_markup=keyboard,
+            )
+            return
+        except Exception:
+            LOGGER.exception(
+                "Échec envoi photo pour '%s', repli sur texte simple", listing.get("title")
+            )
+
+    await context.bot.send_message(
+        chat_id=ALLOWED_CHAT_ID,
+        text=caption,
+        parse_mode=ParseMode.HTML,
+        reply_markup=keyboard,
+    )
+
+
 # ---------------------------------------------------------
 # CYCLE DE SCAN — envoie toutes les annonces whole_phone, sans score,
 # avec un bouton d'achat manuel par annonce (aucun achat automatique)
@@ -814,26 +847,7 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                         continue
 
                     if ALLOWED_CHAT_ID:
-                        photos = listing.get("photos") or []
-                        caption = _format_deal_message(listing)
-                        vinted_item_id = extract_item_id(listing["url"])
-                        keyboard = _listing_keyboard(str(listing_id), listing["url"], vinted_item_id)
-
-                        if photos:
-                            await context.bot.send_photo(
-                                chat_id=ALLOWED_CHAT_ID,
-                                photo=photos[0],
-                                caption=caption,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=keyboard,
-                            )
-                        else:
-                            await context.bot.send_message(
-                                chat_id=ALLOWED_CHAT_ID,
-                                text=caption,
-                                parse_mode=ParseMode.HTML,
-                                reply_markup=keyboard,
-                            )
+                        await _send_listing_notification(context, listing, listing_id)
                         counters["sent"] += 1
 
                 except Exception:
