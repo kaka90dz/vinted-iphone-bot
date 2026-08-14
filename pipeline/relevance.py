@@ -5,19 +5,23 @@ Source de vérité pour décider si une annonce vend réellement un iPhone
 complet — par opposition à un accessoire, une annonce d'acheteur pro,
 une autre marque, ou une annonce ambiguë (aucune mention iPhone).
 
-Version bot Vinted : les catégories "pièce détachée" (part_only),
-"service/réparateur" (repair_service) et "catalogue de vendeur pro"
-(shop_catalog) sont volontairement DÉSACTIVÉES — ces situations
-n'existent quasiment pas sur Vinted (contrairement à Facebook
-Marketplace où des ateliers de réparation et revendeurs pro postent
-des annonces). Les listes de mots-clés PARTS_PATTERNS, SERVICE_PATTERNS
-et CATALOG_PATTERNS restent définies ci-dessous pour référence/débogage,
-mais ne sont plus utilisées dans classify_listing().
+Version bot Vinted : les catégories "service/réparateur" (repair_service)
+et "catalogue de vendeur pro" (shop_catalog) restent désactivées — ces
+situations n'existent quasiment pas sur Vinted. En revanche, les écrans
+et pièces de rechange détachées (qui ne sont clairement PAS des
+téléphones complets) sont désormais filtrés dans ACCESSORY_PATTERNS,
+suite à des cas concrets où des annonces comme "Écran, LCD pour iPhone
+14 Plus" passaient à travers.
+
+MULTI-LANGUE : Vinted.fr remonte des annonces en plusieurs langues
+(italien, espagnol, allemand, portugais). ACCESSORY_PATTERNS couvre
+maintenant les équivalents les plus courants de "coque"/"étui" et
+"chargeur"/"câble" dans ces langues, en plus du français/anglais.
 
 Ordre d'évaluation actif (fixe, ne pas réordonner sans mettre à jour
 les tests) :
     1. acheteur professionnel      -> buyer_ad
-    2. accessoire                  -> accessory
+    2. accessoire (+ écrans/pièces + multi-langue) -> accessory
     3. autre marque                -> other_brand
     4. aucune mention "iPhone"     -> ambiguous
     5. sinon                       -> whole_phone
@@ -46,8 +50,7 @@ def _compile(patterns: list[str]) -> re.Pattern:
 
 
 # ---------------------------------------------------------------------
-# VOCABULAIRE — patterns actifs + patterns conservés pour référence
-# (part_only / repair_service / shop_catalog ne sont plus appliqués)
+# VOCABULAIRE
 # ---------------------------------------------------------------------
 
 BUYER_PATTERNS = [
@@ -57,6 +60,8 @@ BUYER_PATTERNS = [
     "wanted iphone",
 ]
 
+# Conservés pour référence/débogage — plus utilisés dans classify_listing
+# (repair_service et shop_catalog restent désactivés sur ce bot).
 SERVICE_PATTERNS = [
     "reparation", "reparateur", "service de reparation", "nous reparons",
     "je repare", "on repare", "remplacement ecran",
@@ -66,32 +71,34 @@ SERVICE_PATTERNS = [
     "phone sales and repair", "cellfix", "cell fix", "repair shop",
 ]
 
-ACCESSORY_PATTERNS = [
-    "etui", "coque", "housse", "case", "phone case", "wallet case",
-    "flip case", "cover", "bumper", "quad lock", "protecteur ecran",
-    "protecteur d'ecran", "screen protector", "verre trempe",
-    "tempered glass", "vitre protectrice", "glass clear",
-    "support telephone", "phone holder", "car mount", "chargeur",
-    "charger", "cable", "charging cable", "adaptateur", "2 pack",
-    "3 pack", "pack of 2",
-]
-
-PARTS_PATTERNS = [
-    "repair kit", "kit de reparation", "tool kit", "kit d'outils",
-    "opening tool", "replacement screen", "replacement display",
-    "screen assembly", "display assembly", "lcd", "oled", "digitizer",
-    "replacement battery", "batterie neuve", "charging port",
-    "lightning port", "connecteur de charge", "port de charge",
-    "back glass", "vitre arriere", "camera module", "face id module",
-    "motherboard", "logic board", "carte mere", "nappe", "flex cable",
-    "chassis", "housing", "lot de pieces", "pieces detachees",
-    "for iphone", "pour iphone", "compatible avec iphone",
-]
-
 CATALOG_PATTERNS = [
     "tous modeles disponibles", "all models available",
     "plusieurs modeles", "prix selon modele", "prix a partir de",
     "stock disponible", "wholesale", "bulk",
+]
+
+ACCESSORY_PATTERNS = [
+    # Étuis / coques — FR, EN, IT, ES, DE, PT
+    "etui", "coque", "housse", "case", "phone case", "wallet case",
+    "flip case", "cover", "bumper", "quad lock",
+    "custodia", "funda", "hulle", "schutzhulle",
+    "capa", "capinha",
+    # Protections d'écran — FR, EN, IT, ES, DE, PT
+    "protecteur ecran", "protecteur d'ecran", "screen protector",
+    "verre trempe", "tempered glass", "vitre protectrice", "glass clear",
+    "pellicola", "protector de pantalla", "displayschutz", "pelicula",
+    # Supports / chargeurs / câbles — FR, EN, IT, ES, DE
+    "support telephone", "phone holder", "car mount", "chargeur",
+    "charger", "cable", "charging cable", "adaptateur", "2 pack",
+    "3 pack", "pack of 2", "cavo", "adattatore", "cargador",
+    "cable de carga", "ladekabel", "ladegerat",
+    # Écrans / pièces de rechange — clairement pas un téléphone complet
+    "ecran lcd", "ecran de remplacement", "lcd", "oled",
+    "replacement screen", "replacement display", "screen assembly",
+    "display assembly", "digitizer", "vitre arriere", "back glass",
+    "batterie de remplacement", "replacement battery",
+    "schermo", "pantalla de repuesto", "tela de reposicao",
+    "kit de reparation", "repair kit",
 ]
 
 OTHER_BRAND_PATTERNS = [
@@ -114,8 +121,6 @@ _BUYER_RE = _compile(BUYER_PATTERNS)
 _ACCESSORY_RE = _compile(ACCESSORY_PATTERNS)
 _OTHER_BRAND_RE = _compile(OTHER_BRAND_PATTERNS)
 _POSITIVE_RE = _compile(POSITIVE_PATTERNS)
-# _SERVICE_RE, _PARTS_RE, _CATALOG_RE ne sont plus compilés/utilisés —
-# ces filtres sont désactivés sur le bot Vinted (voir docstring).
 
 
 @dataclass
@@ -135,9 +140,10 @@ def _slug(match_text: str) -> str:
 
 
 def classify_listing(title: str, description: str = "") -> ClassificationResult:
-    """Classifie une annonce. part_only / repair_service / shop_catalog
-    sont désactivés (voir docstring du module) — seuls buyer_ad,
-    accessory, other_brand et ambiguous peuvent rejeter une annonce."""
+    """Classifie une annonce. repair_service et shop_catalog restent
+    désactivés (voir docstring du module) — seuls buyer_ad, accessory
+    (incluant écrans/pièces + multi-langue), other_brand et ambiguous
+    peuvent rejeter une annonce."""
     text = _normalize(f"{title} {description}")
 
     m = _BUYER_RE.search(text)
@@ -158,6 +164,7 @@ def classify_listing(title: str, description: str = "") -> ClassificationResult:
             rejection_reason="phone_case" if m.group(0) in (
                 "etui", "coque", "housse", "case", "phone case",
                 "wallet case", "flip case", "cover", "bumper", "quad lock",
+                "custodia", "funda", "hulle", "schutzhulle", "capa", "capinha",
             ) else "accessory",
             matched_rule=f"ACCESSORY_{_slug(m.group(0))}",
             confidence="high",
