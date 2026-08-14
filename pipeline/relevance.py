@@ -84,7 +84,9 @@ ACCESSORY_PATTERNS = [
     "custodia", "funda", "hulle", "schutzhulle",
     "capa", "capinha",
     # Protections d'écran — FR, EN, IT, ES, DE, PT
-    "protecteur ecran", "protecteur d'ecran", "screen protector",
+    "protecteur ecran", "protecteur d'ecran", "protection ecran",
+    "protection d'ecran", "film de protection", "verre de protection",
+    "film protecteur", "screen protector", "screen protection",
     "verre trempe", "tempered glass", "vitre protectrice", "glass clear",
     "pellicola", "protector de pantalla", "displayschutz", "pelicula",
     # Supports / chargeurs / câbles — FR, EN, IT, ES, DE
