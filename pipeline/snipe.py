@@ -17,12 +17,19 @@ Garde-fous appliqués, dans l'ordre :
     4. Prix plancher de plausibilité (évite les erreurs d'affichage du
        type "2€" qui ne peuvent pas être un vrai iPhone complet)
     5. Prix plafond configuré par l'utilisateur (garde-fou dur)
-    6. Marge estimée réelle disponible ET supérieure au seuil configuré
-       (si aucune statistique de revente n'existe pour ce modèle/état,
-       le snipe est automatiquement refusé — pas d'achat "à l'aveugle")
-    7. ROI minimum, si configuré
-    8. Modèle dans la liste blanche, si une liste blanche est définie
-    9. Plafond de dépense quotidienne non dépassé
+    6. Marge estimée réelle disponible (champ margin_eur de
+       pipeline/estimate.py) ET supérieure au seuil configuré — si
+       aucune statistique de revente n'existe pour ce modèle/état
+       (model_price_stats vide), le snipe est automatiquement refusé
+    7. Confiance de l'estimation = "high" obligatoire, c'est-à-dire au
+       moins 3 ventes comparables en base (MIN_SAMPLE_SIZE_TRUSTED côté
+       estimate.py) — une marge calculée sur 1 ou 2 ventes seulement
+       n'est PAS jugée assez fiable pour un achat automatique, même si
+       elle dépasse le seuil configuré. C'est un garde-fou non
+       désactivable : la précision prime sur la vitesse de snipe.
+    8. ROI minimum (roi_pct), si configuré
+    9. Modèle dans la liste blanche, si une liste blanche est définie
+    10. Plafond de dépense quotidienne non dépassé
 
 Le mode "dry-run" (simulation) est actif par défaut au niveau de
 l'appelant (main.py) : aucun achat réel n'est déclenché tant que
@@ -133,15 +140,25 @@ def evaluate_snipe(listing: dict, config: SnipeConfig) -> SnipeDecision:
     if config.max_price_eur is not None and price > config.max_price_eur:
         return SnipeDecision(False, "prix au-dessus du plafond configuré")
 
-    margin = e.get("estimated_margin_eur")
+    margin = e.get("margin_eur")
     if margin is None:
         return SnipeDecision(False, "aucune statistique de revente disponible pour ce modèle/état")
     margin = Decimal(str(margin))
     if config.min_margin_eur is not None and margin < config.min_margin_eur:
         return SnipeDecision(False, "marge estimée sous le seuil configuré")
 
+    # Garde-fou non désactivable : moins de 3 ventes comparables en base
+    # -> pas assez fiable pour un achat automatique.
+    confidence = e.get("estimation_confidence")
+    if confidence != "high":
+        return SnipeDecision(
+            False,
+            f"confiance d'estimation insuffisante ({confidence or 'inconnue'}) — "
+            "échantillon de ventes comparables trop petit",
+        )
+
     if config.min_roi_percent is not None:
-        roi = e.get("estimated_roi_percent")
+        roi = e.get("roi_pct")
         if roi is None:
             return SnipeDecision(False, "ROI non calculable (pas de données suffisantes)")
         if Decimal(str(roi)) < config.min_roi_percent:
