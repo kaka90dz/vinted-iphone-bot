@@ -111,7 +111,7 @@ def percent(value: Decimal) -> str:
 
 
 def get_settings(context: ContextTypes.DEFAULT_TYPE) -> dict[str, Decimal]:
-    settings = context.user_data.setdefault("settings", DEFAULT_SETTINGS.copy())
+    settings = context.bot_data.setdefault("settings", DEFAULT_SETTINGS.copy())
     for key, value in DEFAULT_SETTINGS.items():
         settings.setdefault(key, value)
     return settings
@@ -475,7 +475,7 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         )
         return
     token = context.args[0]
-    context.user_data["vinted_token"] = token
+    context.bot_data["vinted_token"] = token
     try:
         await update.effective_message.delete()
     except Exception:
@@ -490,7 +490,7 @@ async def set_token(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
-    token = context.user_data.get("vinted_token")
+    token = context.bot_data.get("vinted_token")
     if not token:
         await update.effective_message.reply_text("❌ Aucun token enregistré. Utilise /settoken.")
         return
@@ -503,7 +503,7 @@ async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 # ---------------------------------------------------------
 
 def _format_snipe_status(context: ContextTypes.DEFAULT_TYPE) -> str:
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
     mode = "🔴 RÉEL (achète vraiment)" if config.live_mode else "🧪 Simulation (n'achète rien)"
     status = "✅ activé" if config.enabled else "❌ désactivé"
     lines = [
@@ -524,7 +524,7 @@ async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if not await check_access(update):
         return
     args = context.args
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
 
     if not args:
         await update.effective_message.reply_text(_format_snipe_status(context), parse_mode=ParseMode.HTML)
@@ -541,7 +541,7 @@ async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             )
             return
         config.enabled = True
-        save_snipe_config(context.user_data, config)
+        save_snipe_config(context.bot_data, config)
         await update.effective_message.reply_text(
             "✅ Sniping activé — en mode simulation par défaut, aucun achat réel ne sera fait.\n"
             "Pour passer en mode réel : <code>/snipe live confirme</code>",
@@ -552,13 +552,13 @@ async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if action == "off":
         config.enabled = False
         config.live_mode = False
-        save_snipe_config(context.user_data, config)
+        save_snipe_config(context.bot_data, config)
         await update.effective_message.reply_text("✅ Sniping désactivé (retour aux notifications normales).")
         return
 
     if action == "dryrun":
         config.live_mode = False
-        save_snipe_config(context.user_data, config)
+        save_snipe_config(context.bot_data, config)
         await update.effective_message.reply_text("🧪 Mode simulation activé — plus aucun achat réel ne sera fait.")
         return
 
@@ -575,11 +575,11 @@ async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         if not config.enabled:
             await update.effective_message.reply_text("❌ Active d'abord le sniping avec <code>/snipe on</code>.", parse_mode=ParseMode.HTML)
             return
-        if not context.user_data.get("vinted_token"):
+        if not context.bot_data.get("vinted_token"):
             await update.effective_message.reply_text("❌ Enregistre d'abord ton token avec /settoken.")
             return
         config.live_mode = True
-        save_snipe_config(context.user_data, config)
+        save_snipe_config(context.bot_data, config)
         await update.effective_message.reply_text(
             "🔴 <b>Mode réel activé.</b> Le bot achètera automatiquement les annonces "
             "qui remplissent tes critères. <code>/snipe dryrun</code> pour repasser en simulation à tout moment.",
@@ -611,9 +611,9 @@ async def set_snipe_max(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except ValueError:
         await update.effective_message.reply_text("❌ Entre un montant positif.")
         return
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
     config.max_price_eur = value
-    save_snipe_config(context.user_data, config)
+    save_snipe_config(context.bot_data, config)
     await update.effective_message.reply_text(f"✅ Prix plafond de sniping réglé à {money(value)}.")
 
 
@@ -628,9 +628,9 @@ async def set_snipe_margin(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     except ValueError:
         await update.effective_message.reply_text("❌ Entre un montant positif.")
         return
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
     config.min_margin_eur = value
-    save_snipe_config(context.user_data, config)
+    save_snipe_config(context.bot_data, config)
     await update.effective_message.reply_text(
         f"✅ Marge minimale de sniping réglée à {money(value)}. "
         "Rappel : sans statistiques de revente pour un modèle/état, le snipe est toujours refusé."
@@ -648,9 +648,9 @@ async def set_snipe_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     except ValueError:
         await update.effective_message.reply_text("❌ Entre un pourcentage positif.")
         return
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
     config.min_roi_percent = value
-    save_snipe_config(context.user_data, config)
+    save_snipe_config(context.bot_data, config)
     await update.effective_message.reply_text(f"✅ ROI minimum de sniping réglé à {percent(value)}.")
 
 
@@ -665,15 +665,15 @@ async def set_snipe_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -
         )
         return
     raw = " ".join(context.args)
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
     if raw.strip().lower() == "tous":
         config.allowed_models = None
-        save_snipe_config(context.user_data, config)
+        save_snipe_config(context.bot_data, config)
         await update.effective_message.reply_text("✅ Liste blanche retirée — tous les modèles sont autorisés.")
         return
     models = {m.strip() for m in raw.split(",") if m.strip()}
     config.allowed_models = models
-    save_snipe_config(context.user_data, config)
+    save_snipe_config(context.bot_data, config)
     await update.effective_message.reply_text(f"✅ Liste blanche réglée sur : {', '.join(sorted(models))}")
 
 
@@ -688,9 +688,9 @@ async def set_snipe_daily_cap(update: Update, context: ContextTypes.DEFAULT_TYPE
     except ValueError:
         await update.effective_message.reply_text("❌ Entre un montant positif.")
         return
-    config = get_snipe_config(context.user_data)
+    config = get_snipe_config(context.bot_data)
     config.daily_cap_eur = value
-    save_snipe_config(context.user_data, config)
+    save_snipe_config(context.bot_data, config)
     await update.effective_message.reply_text(f"✅ Plafond de dépense quotidienne réglé à {money(value)}.")
 
 
@@ -764,7 +764,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         await run_scan_cycle(context, manual=True, reply_message=query.message)
     elif query.data.startswith("buy:"):
         item_id = query.data.split(":", 1)[1]
-        token = context.user_data.get("vinted_token")
+        token = context.bot_data.get("vinted_token")
         if not token:
             await query.message.reply_text("❌ Aucun token Vinted enregistré. Utilise /settoken.")
             return
@@ -808,7 +808,7 @@ async def send_bot_state(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     anthropic_status = "désactivé (crédit insuffisant)" if normalize_module.ANTHROPIC_DISABLED else (
         "actif" if USE_ANTHROPIC_NORMALIZER else "désactivé (config)"
     )
-    snipe_config = get_snipe_config(context.user_data)
+    snipe_config = get_snipe_config(context.bot_data)
     snipe_line = "désactivé"
     if snipe_config.enabled:
         snipe_line = "🔴 RÉEL" if snipe_config.live_mode else "🧪 simulation"
@@ -1029,7 +1029,7 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
             "duplicates": 0, "sent": 0, "sniped": 0, "errors": 0,
         }
 
-        stored = context.application.user_data.setdefault(int(ALLOWED_CHAT_ID), {}) if ALLOWED_CHAT_ID else {}
+        stored = context.bot_data
 
         for fetch_source in SOURCES:
             try:
