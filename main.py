@@ -31,6 +31,12 @@ from pipeline.normalize import normalize_listing, USE_ANTHROPIC_NORMALIZER
 import pipeline.normalize as normalize_module
 from pipeline.estimate import estimate_listing
 from pipeline.vinted_buy import attempt_purchase, AutobuyError, extract_item_id
+from pipeline.snipe import (
+    get_snipe_config,
+    save_snipe_config,
+    evaluate_snipe,
+    record_spend,
+)
 from storage.db import insert_listing, get_recent_sent, get_connection
 
 
@@ -70,12 +76,13 @@ BOT_STATE = {
     "last_found": 0,
     "last_sent": 0,
     "last_duplicates": 0,
+    "last_sniped": 0,
     "last_error": None,
 }
 
 
 # ---------------------------------------------------------
-# OUTILS CALCULATEUR (commandes conservées, plus dans le menu)
+# OUTILS CALCULATEUR
 # ---------------------------------------------------------
 
 def parse_decimal(value: str) -> Decimal:
@@ -208,8 +215,7 @@ def build_analysis(*, purchase_price, resale_price, repair_cost, shipping_in, ot
 
 
 # ---------------------------------------------------------
-# COMMANDES CALCULATEUR (toujours utilisables en tapant la commande,
-# retirées du menu à boutons)
+# COMMANDES CALCULATEUR
 # ---------------------------------------------------------
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -218,6 +224,8 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = (
         "🤖 <b>Bot Vinted iPhone</b>\n\n"
         "<b>Calculateur :</b> /analyse, /simple, /enchere, /compare, /reglages\n"
+        "<b>Achat manuel :</b> /settoken puis bouton par annonce\n"
+        "<b>Sniping :</b> /snipestatus — voir /aide pour tout configurer\n"
         "<b>Menu :</b> /menu\n\n"
         "🔎 Le scan automatique Vinted tourne en tâche de fond (toutes les "
         f"{CYCLE_SECONDS}s) et envoie toutes les annonces de téléphones "
@@ -490,6 +498,202 @@ async def token_status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     await update.effective_message.reply_text(f"🔑 Token enregistré : <code>{masked}</code>", parse_mode=ParseMode.HTML)
 
 
+# ---------------------------------------------------------
+# COMMANDES SNIPE
+# ---------------------------------------------------------
+
+def _format_snipe_status(context: ContextTypes.DEFAULT_TYPE) -> str:
+    config = get_snipe_config(context.user_data)
+    mode = "🔴 RÉEL (achète vraiment)" if config.live_mode else "🧪 Simulation (n'achète rien)"
+    status = "✅ activé" if config.enabled else "❌ désactivé"
+    lines = [
+        "🎯 <b>Statut du sniping</b>\n",
+        f"État : {status}",
+        f"Mode : {mode}",
+        f"Prix plafond : {money(config.max_price_eur) if config.max_price_eur else 'non défini'}",
+        f"Marge minimale exigée : {money(config.min_margin_eur) if config.min_margin_eur else 'non définie'}",
+        f"ROI minimum : {percent(config.min_roi_percent) if config.min_roi_percent else 'non défini'}",
+        f"Modèles autorisés : {', '.join(sorted(config.allowed_models)) if config.allowed_models else 'tous'}",
+        f"Plafond quotidien : {money(config.daily_cap_eur) if config.daily_cap_eur else 'non défini'}",
+        f"Dépensé aujourd'hui : {money(config.spent_today_eur)}",
+    ]
+    return "\n".join(lines)
+
+
+async def snipe_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    args = context.args
+    config = get_snipe_config(context.user_data)
+
+    if not args:
+        await update.effective_message.reply_text(_format_snipe_status(context), parse_mode=ParseMode.HTML)
+        return
+
+    action = args[0].lower()
+
+    if action == "on":
+        if config.max_price_eur is None or config.min_margin_eur is None:
+            await update.effective_message.reply_text(
+                "❌ Configure d'abord un prix plafond (<code>/setsnipemax 80</code>) "
+                "et une marge minimale (<code>/setsnipemargin 25</code>) avant d'activer le sniping.",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        config.enabled = True
+        save_snipe_config(context.user_data, config)
+        await update.effective_message.reply_text(
+            "✅ Sniping activé — en mode simulation par défaut, aucun achat réel ne sera fait.\n"
+            "Pour passer en mode réel : <code>/snipe live confirme</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    if action == "off":
+        config.enabled = False
+        config.live_mode = False
+        save_snipe_config(context.user_data, config)
+        await update.effective_message.reply_text("✅ Sniping désactivé (retour aux notifications normales).")
+        return
+
+    if action == "dryrun":
+        config.live_mode = False
+        save_snipe_config(context.user_data, config)
+        await update.effective_message.reply_text("🧪 Mode simulation activé — plus aucun achat réel ne sera fait.")
+        return
+
+    if action == "live":
+        if len(args) != 2 or args[1].lower() != "confirme":
+            await update.effective_message.reply_text(
+                "⚠️ <b>Attention</b> — passer en mode réel signifie que le bot achètera "
+                "automatiquement dès qu'une annonce remplit tes critères, en utilisant ton "
+                "token Vinted et ton argent réel.\n\n"
+                "Si tu es sûr, retape : <code>/snipe live confirme</code>",
+                parse_mode=ParseMode.HTML,
+            )
+            return
+        if not config.enabled:
+            await update.effective_message.reply_text("❌ Active d'abord le sniping avec <code>/snipe on</code>.", parse_mode=ParseMode.HTML)
+            return
+        if not context.user_data.get("vinted_token"):
+            await update.effective_message.reply_text("❌ Enregistre d'abord ton token avec /settoken.")
+            return
+        config.live_mode = True
+        save_snipe_config(context.user_data, config)
+        await update.effective_message.reply_text(
+            "🔴 <b>Mode réel activé.</b> Le bot achètera automatiquement les annonces "
+            "qui remplissent tes critères. <code>/snipe dryrun</code> pour repasser en simulation à tout moment.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await update.effective_message.reply_text(
+        "Utilisation : <code>/snipe on|off|live confirme|dryrun</code>\n"
+        "Sans argument : affiche le statut.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def snipe_status_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    await update.effective_message.reply_text(_format_snipe_status(context), parse_mode=ParseMode.HTML)
+
+
+async def set_snipe_max(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Exemple : <code>/setsnipemax 80</code>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        value = parse_decimal(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Entre un montant positif.")
+        return
+    config = get_snipe_config(context.user_data)
+    config.max_price_eur = value
+    save_snipe_config(context.user_data, config)
+    await update.effective_message.reply_text(f"✅ Prix plafond de sniping réglé à {money(value)}.")
+
+
+async def set_snipe_margin(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Exemple : <code>/setsnipemargin 25</code>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        value = parse_decimal(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Entre un montant positif.")
+        return
+    config = get_snipe_config(context.user_data)
+    config.min_margin_eur = value
+    save_snipe_config(context.user_data, config)
+    await update.effective_message.reply_text(
+        f"✅ Marge minimale de sniping réglée à {money(value)}. "
+        "Rappel : sans statistiques de revente pour un modèle/état, le snipe est toujours refusé."
+    )
+
+
+async def set_snipe_roi(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Exemple : <code>/setsniperoi 30</code>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        value = parse_decimal(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Entre un pourcentage positif.")
+        return
+    config = get_snipe_config(context.user_data)
+    config.min_roi_percent = value
+    save_snipe_config(context.user_data, config)
+    await update.effective_message.reply_text(f"✅ ROI minimum de sniping réglé à {percent(value)}.")
+
+
+async def set_snipe_models(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if not context.args:
+        await update.effective_message.reply_text(
+            "Exemple : <code>/setsnipemodels iPhone 12,iPhone 13,iPhone 13 Pro</code>\n"
+            "<code>/setsnipemodels tous</code> pour retirer la liste blanche.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    raw = " ".join(context.args)
+    config = get_snipe_config(context.user_data)
+    if raw.strip().lower() == "tous":
+        config.allowed_models = None
+        save_snipe_config(context.user_data, config)
+        await update.effective_message.reply_text("✅ Liste blanche retirée — tous les modèles sont autorisés.")
+        return
+    models = {m.strip() for m in raw.split(",") if m.strip()}
+    config.allowed_models = models
+    save_snipe_config(context.user_data, config)
+    await update.effective_message.reply_text(f"✅ Liste blanche réglée sur : {', '.join(sorted(models))}")
+
+
+async def set_snipe_daily_cap(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not await check_access(update):
+        return
+    if len(context.args) != 1:
+        await update.effective_message.reply_text("Exemple : <code>/setsnipedailycap 300</code>", parse_mode=ParseMode.HTML)
+        return
+    try:
+        value = parse_decimal(context.args[0])
+    except ValueError:
+        await update.effective_message.reply_text("❌ Entre un montant positif.")
+        return
+    config = get_snipe_config(context.user_data)
+    config.daily_cap_eur = value
+    save_snipe_config(context.user_data, config)
+    await update.effective_message.reply_text(f"✅ Plafond de dépense quotidienne réglé à {money(value)}.")
+
+
 async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not await check_access(update):
         return
@@ -499,9 +703,20 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         "<b>Analyse simplifiée</b>\n<code>/simple achat revente réparation livraison</code>\n\n"
         "<b>Enchère maximale</b>\n<code>/enchere revente réparation livraison autres frais% risque%</code>\n\n"
         "<b>Comparer</b>\n<code>/compare achat1 revente1 achat2 revente2 frais% risque%</code>\n\n"
-        "<b>Réglages</b>\n<code>/reglages</code> · <code>/setmarge 40</code> · <code>/setroi 25</code>\n\n"
-        "<b>Achat</b>\n<code>/settoken TON_TOKEN</code> une seule fois, puis appuie sur "
+        "<b>Réglages calculateur</b>\n<code>/reglages</code> · <code>/setmarge 40</code> · <code>/setroi 25</code>\n\n"
+        "<b>Achat manuel</b>\n<code>/settoken TON_TOKEN</code> une seule fois, puis bouton "
         "\"🛒 Acheter maintenant\" sur les annonces qui t'intéressent\n\n"
+        "<b>🎯 Sniping automatique</b>\n"
+        "<code>/setsnipemax 80</code> — prix plafond\n"
+        "<code>/setsnipemargin 25</code> — marge minimale exigée (obligatoire)\n"
+        "<code>/setsniperoi 30</code> — ROI minimum (optionnel)\n"
+        "<code>/setsnipemodels iPhone 12,iPhone 13</code> — liste blanche (optionnel)\n"
+        "<code>/setsnipedailycap 300</code> — plafond de dépense quotidienne (optionnel)\n"
+        "<code>/snipe on</code> — active (mode simulation par défaut)\n"
+        "<code>/snipe live confirme</code> — passe en achats réels\n"
+        "<code>/snipe dryrun</code> — repasse en simulation\n"
+        "<code>/snipe off</code> — désactive tout\n"
+        "<code>/snipestatus</code> — voir la config actuelle\n\n"
         "<b>Scan</b>\n<code>/scan</code> lance un scan manuel immédiat\n\n"
         "<b>Menu :</b> /menu",
         parse_mode=ParseMode.HTML,
@@ -593,12 +808,18 @@ async def send_bot_state(message, context: ContextTypes.DEFAULT_TYPE) -> None:
     anthropic_status = "désactivé (crédit insuffisant)" if normalize_module.ANTHROPIC_DISABLED else (
         "actif" if USE_ANTHROPIC_NORMALIZER else "désactivé (config)"
     )
+    snipe_config = get_snipe_config(context.user_data)
+    snipe_line = "désactivé"
+    if snipe_config.enabled:
+        snipe_line = "🔴 RÉEL" if snipe_config.live_mode else "🧪 simulation"
     await message.reply_text(
         "📊 <b>État du bot</b>\n\n"
         f"Catégorie active : {get_current_category_label()}\n"
         f"Fréquence de scan : toutes les {CYCLE_SECONDS}s\n"
+        f"Sniping : {snipe_line}\n"
         f"Dernier scan — trouvées : {BOT_STATE['last_found']}\n"
         f"Dernier scan — envoyées : {BOT_STATE['last_sent']}\n"
+        f"Dernier scan — snipées : {BOT_STATE['last_sniped']}\n"
         f"Dernier scan — doublons : {BOT_STATE['last_duplicates']}\n"
         f"Dernière erreur : {BOT_STATE['last_error'] or 'aucune'}\n"
         f"Normaliseur Anthropic : {anthropic_status}",
@@ -612,12 +833,11 @@ async def send_filters_summary(message) -> None:
     await message.reply_text(
         "🧰 <b>Filtres actifs</b>\n\n"
         f"Acheteurs pro : {len(BUYER_PATTERNS)} règles\n"
-        f"Accessoires : {len(ACCESSORY_PATTERNS)} règles\n"
+        f"Accessoires (multi-langue + écrans/pièces) : {len(ACCESSORY_PATTERNS)} règles\n"
         f"Autres marques : {len(OTHER_BRAND_PATTERNS)} règles\n\n"
-        "🚫 Désactivés (spécifique Vinted) : pièces détachées, "
-        "services/réparateurs, catalogues de vendeurs pro\n\n"
+        "🚫 Désactivés (spécifique Vinted) : services/réparateurs, catalogues de vendeurs pro\n\n"
         f"Catégorie de recherche active : {get_current_category_label()}\n"
-        "Seuls les téléphones complets (whole_phone) sont envoyés — aucun filtre de score.",
+        "Seuls les téléphones complets (whole_phone) sont envoyés.",
         parse_mode=ParseMode.HTML,
     )
 
@@ -669,8 +889,7 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 # ---------------------------------------------------------
-# NOTIFICATION D'UNE ANNONCE — format façon Discord, avec les vraies
-# données disponibles (pas de note inventée, pas de TTC estimé au hasard)
+# NOTIFICATION D'UNE ANNONCE
 # ---------------------------------------------------------
 
 def _format_listing_age(posted_at_iso: str | None) -> str:
@@ -703,6 +922,17 @@ _CONDITION_LABELS = {
 }
 
 
+def _format_description_snippet(description: str | None, max_length: int = 220) -> str | None:
+    if not description:
+        return None
+    text = " ".join(description.strip().split())
+    if not text:
+        return None
+    if len(text) <= max_length:
+        return text
+    return text[:max_length].rstrip() + "…"
+
+
 def _format_deal_message(listing: dict) -> str:
     n = listing.get("normalized", {})
     e = listing.get("estimation", {})
@@ -718,6 +948,7 @@ def _format_deal_message(listing: dict) -> str:
     storage_label = f"{storage} Go" if storage else (vinted_size or "Non précisé")
 
     seller_login = listing.get("seller_login")
+    description_snippet = _format_description_snippet(listing.get("description"))
 
     lines = [
         f"📱 <b>{n.get('model') or listing.get('title', '?')}</b>\n",
@@ -727,6 +958,8 @@ def _format_deal_message(listing: dict) -> str:
         f"💎 <b>État</b>\n{condition_label}\n",
         f"💰 <b>Prix</b>\n{price} €" if price is not None else "💰 <b>Prix</b>\nnon précisé",
     ]
+    if description_snippet:
+        lines.append(f"\n📝 <b>Description</b>\n{description_snippet}")
     if seller_login:
         lines.append(f"\n👤 {seller_login}")
     return "\n".join(lines)
@@ -744,13 +977,12 @@ def _listing_keyboard(listing_id: str, url: str, vinted_item_id: str | None) -> 
     return InlineKeyboardMarkup(rows)
 
 
-async def _send_listing_notification(context: ContextTypes.DEFAULT_TYPE, listing: dict, listing_id) -> None:
+async def _send_listing_notification(context: ContextTypes.DEFAULT_TYPE, listing: dict, listing_id, prefix: str = "") -> None:
     """Envoie la notification pour une annonce. Si l'envoi avec photo
     échoue pour n'importe quelle raison, bascule automatiquement sur un
-    envoi en texte simple — l'annonce n'est jamais perdue silencieusement
-    juste parce qu'une URL de photo est mal formée."""
+    envoi en texte simple — l'annonce n'est jamais perdue silencieusement."""
     photos = listing.get("photos") or []
-    caption = _format_deal_message(listing)
+    caption = prefix + _format_deal_message(listing)
     vinted_item_id = extract_item_id(listing["url"])
     keyboard = _listing_keyboard(str(listing_id), listing["url"], vinted_item_id)
 
@@ -778,8 +1010,8 @@ async def _send_listing_notification(context: ContextTypes.DEFAULT_TYPE, listing
 
 
 # ---------------------------------------------------------
-# CYCLE DE SCAN — envoie toutes les annonces whole_phone, sans score,
-# avec un bouton d'achat manuel par annonce (aucun achat automatique)
+# CYCLE DE SCAN — envoie toutes les annonces whole_phone, tente le
+# snipe automatique si activé et éligible, jamais d'achat silencieux
 # ---------------------------------------------------------
 
 async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = False, reply_message=None) -> dict:
@@ -794,8 +1026,10 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
             "rejected_accessory": 0, "rejected_parts": 0, "rejected_service": 0,
             "rejected_buyer": 0, "rejected_other_brand": 0, "rejected_catalog": 0,
             "rejected_ambiguous": 0, "rejected_too_old": 0, "rejected_too_far": 0,
-            "duplicates": 0, "sent": 0, "errors": 0,
+            "duplicates": 0, "sent": 0, "sniped": 0, "errors": 0,
         }
+
+        stored = context.application.user_data.setdefault(int(ALLOWED_CHAT_ID), {}) if ALLOWED_CHAT_ID else {}
 
         for fetch_source in SOURCES:
             try:
@@ -846,9 +1080,45 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                     if listing.get("relevance", {}).get("listing_type") != "whole_phone":
                         continue
 
-                    if ALLOWED_CHAT_ID:
+                    if not ALLOWED_CHAT_ID:
+                        continue
+
+                    snipe_config = get_snipe_config(stored)
+                    decision = evaluate_snipe(listing, snipe_config)
+                    vinted_item_id = extract_item_id(listing["url"])
+                    token = stored.get("vinted_token")
+
+                    sniped = False
+                    if decision.eligible and vinted_item_id and token:
+                        price = listing.get("estimation", {}).get("listing_price_eur")
+                        if snipe_config.live_mode:
+                            try:
+                                result = await attempt_purchase(token, vinted_item_id)
+                                if price is not None:
+                                    record_spend(stored, Decimal(str(price)))
+                                await _send_listing_notification(
+                                    context, listing, listing_id, prefix="🎯✅ <b>SNIPÉ AUTOMATIQUEMENT</b>\n\n"
+                                )
+                                LOGGER.info("Snipe réussi pour '%s': %s", listing.get("title"), result)
+                                sniped = True
+                                counters["sniped"] += 1
+                            except AutobuyError:
+                                LOGGER.exception(
+                                    "Échec snipe pour '%s', notification normale en secours",
+                                    listing.get("title"),
+                                )
+                        else:
+                            await _send_listing_notification(
+                                context, listing, listing_id,
+                                prefix="🎯🧪 <b>AURAIT ÉTÉ SNIPÉ (mode simulation)</b>\n\n",
+                            )
+                            sniped = True
+                            counters["sniped"] += 1
+
+                    if not sniped:
                         await _send_listing_notification(context, listing, listing_id)
-                        counters["sent"] += 1
+
+                    counters["sent"] += 1
 
                 except Exception:
                     LOGGER.exception("Échec pipeline pour l'annonce: %s", listing.get("title"))
@@ -856,6 +1126,7 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
 
         BOT_STATE["last_found"] = counters["found_raw"]
         BOT_STATE["last_sent"] = counters["sent"]
+        BOT_STATE["last_sniped"] = counters["sniped"]
         BOT_STATE["last_duplicates"] = counters["duplicates"]
         BOT_STATE["last_error"] = None if counters["errors"] == 0 else f"{counters['errors']} erreur(s)"
 
@@ -866,8 +1137,8 @@ async def run_scan_cycle(context: ContextTypes.DEFAULT_TYPE, manual: bool = Fals
                 chat_id=ALLOWED_CHAT_ID,
                 text=(
                     "✅ <b>Scan terminé</b>\n\n"
-                    f"Trouvées : {counters['found_raw']} · Envoyées : {counters['sent']} · "
-                    f"Doublons : {counters['duplicates']}\n"
+                    f"Trouvées : {counters['found_raw']} · Envoyées : {counters['sent']} "
+                    f"(dont snipées : {counters['sniped']}) · Doublons : {counters['duplicates']}\n"
                     f"Rejetées — accessoires : {counters['rejected_accessory']}, "
                     f"acheteurs : {counters['rejected_buyer']}, autres marques : {counters['rejected_other_brand']}, "
                     f"ambiguës : {counters['rejected_ambiguous']}\n"
@@ -906,8 +1177,15 @@ async def post_init(application: Application) -> None:
         ("reglages", "Afficher les réglages"),
         ("setmarge", "Modifier la marge minimale"),
         ("setroi", "Modifier le ROI minimum"),
-        ("settoken", "Enregistrer ton token Vinted (pour acheter)"),
+        ("settoken", "Enregistrer ton token Vinted"),
         ("tokenstatus", "Voir si un token est enregistré"),
+        ("snipe", "Gérer le sniping automatique"),
+        ("snipestatus", "Voir la config du sniping"),
+        ("setsnipemax", "Prix plafond du sniping"),
+        ("setsnipemargin", "Marge minimale du sniping"),
+        ("setsniperoi", "ROI minimum du sniping"),
+        ("setsnipemodels", "Liste blanche de modèles"),
+        ("setsnipedailycap", "Plafond de dépense quotidien"),
         ("aide", "Afficher le guide"),
     ])
     LOGGER.info("Commandes Telegram configurées.")
@@ -938,6 +1216,13 @@ def main() -> None:
     application.add_handler(CommandHandler("setroi", set_roi))
     application.add_handler(CommandHandler("settoken", set_token))
     application.add_handler(CommandHandler("tokenstatus", token_status))
+    application.add_handler(CommandHandler("snipe", snipe_command))
+    application.add_handler(CommandHandler("snipestatus", snipe_status_command))
+    application.add_handler(CommandHandler("setsnipemax", set_snipe_max))
+    application.add_handler(CommandHandler("setsnipemargin", set_snipe_margin))
+    application.add_handler(CommandHandler("setsniperoi", set_snipe_roi))
+    application.add_handler(CommandHandler("setsnipemodels", set_snipe_models))
+    application.add_handler(CommandHandler("setsnipedailycap", set_snipe_daily_cap))
     application.add_handler(CommandHandler("aide", help_command))
     application.add_handler(CommandHandler("help", help_command))
     application.add_handler(CallbackQueryHandler(button_handler))
