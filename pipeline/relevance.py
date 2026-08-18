@@ -78,11 +78,12 @@ CATALOG_PATTERNS = [
 ]
 
 ACCESSORY_PATTERNS = [
-    # Étuis / coques — FR, EN, IT, ES, DE, PT
-    "etui", "coque", "housse", "case", "phone case", "wallet case",
-    "flip case", "cover", "bumper", "quad lock",
-    "custodia", "funda", "hulle", "schutzhulle",
-    "capa", "capinha",
+    # Étuis / coques — FR, EN, IT, ES, DE, PT (singulier + pluriel)
+    "etui", "etuis", "coque", "coques", "housse", "housses",
+    "case", "cases", "phone case", "phone cases", "wallet case",
+    "flip case", "cover", "covers", "bumper", "quad lock",
+    "custodia", "custodie", "funda", "fundas", "hulle", "hullen",
+    "schutzhulle", "capa", "capas", "capinha", "capinhas",
     # Protections d'écran — FR, EN, IT, ES, DE, PT
     "protecteur ecran", "protecteur d'ecran", "protection ecran",
     "protection d'ecran", "film de protection", "verre de protection",
@@ -164,9 +165,11 @@ def classify_listing(title: str, description: str = "") -> ClassificationResult:
             is_relevant=False,
             listing_type="accessory",
             rejection_reason="phone_case" if m.group(0) in (
-                "etui", "coque", "housse", "case", "phone case",
-                "wallet case", "flip case", "cover", "bumper", "quad lock",
-                "custodia", "funda", "hulle", "schutzhulle", "capa", "capinha",
+                "etui", "etuis", "coque", "coques", "housse", "housses",
+                "case", "cases", "phone case", "phone cases", "wallet case",
+                "flip case", "cover", "covers", "bumper", "quad lock",
+                "custodia", "custodie", "funda", "fundas", "hulle", "hullen",
+                "schutzhulle", "capa", "capas", "capinha", "capinhas",
             ) else "accessory",
             matched_rule=f"ACCESSORY_{_slug(m.group(0))}",
             confidence="high",
